@@ -19,8 +19,8 @@ namespace wfc::adodb {
 
 // A field value. monostate is Null.
 using Blob = std::vector<unsigned char>;
-using Value = std::variant<std::monostate, std::int64_t, double, std::string,
-                           Blob>;
+using Value =
+    std::variant<std::monostate, std::int64_t, double, std::string, Blob>;
 
 // DataTypeEnum values used when reporting a field.
 enum DataType : int {
@@ -46,14 +46,22 @@ struct Error {
 struct FieldInfo {
     std::string name;
     int type{adEmpty};
+    long defined_size{0};
 };
 
 // A client-side static cursor: the whole result is read when it is opened, as
 // ADO does for adUseClient. Positions are 0-based internally; AbsolutePosition
-// is 1-based as in ADO.
+// is 1-based as in ADO. A recordset that comes from Connection::execute is
+// read-only. One made with Recordset::create (fields appended, then
+// open_empty) is disconnected and editable: add_new, set_value, update,
+// cancel_update, delete_current.
 class Recordset {
 public:
+    // A closed, disconnected recordset whose fields can be appended.
+    [[nodiscard]] static std::shared_ptr<Recordset> create();
+
     [[nodiscard]] int state() const noexcept { return state_; }
+    [[nodiscard]] bool editable() const noexcept { return editable_; }
     [[nodiscard]] std::size_t field_count() const noexcept {
         return fields_.size();
     }
@@ -63,14 +71,21 @@ public:
     // Index of the field called name (case-insensitive), or -1.
     [[nodiscard]] int field_index(std::string_view name) const noexcept;
 
+    // Fields.Append; only while the recordset is closed and disconnected.
+    bool append_field(std::string_view name, int type, long defined_size);
+    // Recordset.Open without a source: opens with the appended fields, no rows.
+    bool open_empty();
+
     [[nodiscard]] bool bof() const noexcept { return empty() || position_ < 0; }
     [[nodiscard]] bool eof() const noexcept {
-        return empty() || position_ >= static_cast<long>(rows_.size());
+        return empty() || position_ >= static_cast<long>(view_.size());
     }
+    // The rows that pass the filter.
     [[nodiscard]] long record_count() const noexcept {
-        return static_cast<long>(rows_.size());
+        return static_cast<long>(view_.size());
     }
-    // 1-based; -1 (adPosBOF) before the first row, -2 (adPosEOF) after the last.
+    // 1-based; -1 (adPosBOF) before the first row, -2 (adPosEOF) after the
+    // last.
     [[nodiscard]] long absolute_position() const noexcept;
 
     void move_first() noexcept;
@@ -84,13 +99,38 @@ public:
     // The value of a field of the current row; Null when there is none.
     [[nodiscard]] const Value& value(std::size_t index) const;
 
+    // Editing (disconnected recordsets only; each returns false when it is not
+    // allowed here or there is no current record).
+    bool add_new();
+    bool set_value(std::size_t index, Value value);
+    bool update();
+    bool cancel_update();
+    bool delete_current();
+
+    // Filter criteria: field op literal, joined by AND / OR; an empty text
+    // removes the filter. False when the text is not understood.
+    bool set_filter(std::string_view criteria);
+    [[nodiscard]] const std::string& filter() const noexcept { return filter_; }
+    // Find: moves to the first row at or after the current one (plus skip)
+    // that meets the criteria; at EOF when there is none.
+    bool find(std::string_view criteria, long skip = 0, bool forward = true);
+
 private:
     friend class Connection;
-    [[nodiscard]] bool empty() const noexcept { return rows_.empty(); }
+    [[nodiscard]] bool empty() const noexcept { return view_.empty(); }
+    [[nodiscard]] bool matches(const std::vector<Value>& row,
+                               std::string_view criteria, bool& valid) const;
+    void rebuild_view();
 
     int state_{adStateClosed};
+    bool editable_{false};
+    bool pending_{false};       // add_new or an edit not yet updated
+    bool pending_new_{false};   // the pending row is a new one
+    std::vector<Value> saved_;  // the row as it was before an edit
     std::vector<FieldInfo> fields_;
     std::vector<std::vector<Value>> rows_;
+    std::vector<std::size_t> view_;  // indexes into rows_ in cursor order
+    std::string filter_;
     long position_{0};
 };
 
@@ -108,10 +148,11 @@ public:
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
 
-    // ConnectionString: "Data Source=path" or "Database=path" or "File Name=path"
-    // (other keys, among them Provider and Driver, are accepted and ignored). A
-    // bare string with no "=" is taken as the path. ":memory:" opens a private
-    // in-memory database. Returns false and fills errors() on failure.
+    // ConnectionString: "Data Source=path" or "Database=path" or "File
+    // Name=path" (other keys, among them Provider and Driver, are accepted and
+    // ignored). A bare string with no "=" is taken as the path. ":memory:"
+    // opens a private in-memory database. Returns false and fills errors() on
+    // failure.
     bool open(std::string_view connection_string);
     void close() noexcept;
     [[nodiscard]] int state() const noexcept;

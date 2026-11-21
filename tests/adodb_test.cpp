@@ -56,10 +56,12 @@ int main() {
     auto& rs = *q.recordset;
     check(rs.field_count() == 4 && rs.field(1).name == "name", "field names");
     check(rs.field(0).type == adInteger && rs.field(1).type == adVarWChar &&
-              rs.field(2).type == adDouble && rs.field(3).type == adLongVarBinary,
+              rs.field(2).type == adDouble &&
+              rs.field(3).type == adLongVarBinary,
           "field types from declarations");
     check(rs.field_index("NAME") == 1, "field index ignores case");
-    check(!rs.bof() && !rs.eof() && rs.absolute_position() == 1, "at first row");
+    check(!rs.bof() && !rs.eof() && rs.absolute_position() == 1,
+          "at first row");
     check(std::get<std::string>(rs.value(1)) == "ann", "first name");
     check(std::get<double>(rs.value(2)) == 1.5, "first score");
     check(rs.move_next() && std::get<std::string>(rs.value(1)) == "bob",
@@ -100,6 +102,53 @@ int main() {
               cn.errors().back().number == -2147217873L,
           "constraint error");
     check(!cn.execute("select ?").ok, "missing parameter");
+
+    // A disconnected recordset: fields, rows, filter, find, delete.
+    auto mem = Recordset::create();
+    check(mem->append_field("id", adInteger, 0) &&
+              mem->append_field("name", adVarWChar, 20) &&
+              !mem->append_field("ID", adInteger, 0),
+          "append fields, no duplicates");
+    check(mem->state() == adStateClosed && mem->open_empty() &&
+              mem->state() == adStateOpen,
+          "open empty");
+    check(mem->bof() && mem->eof() && mem->record_count() == 0, "starts empty");
+    for (std::int64_t i = 1; i <= 4; ++i) {
+        check(mem->add_new(), "add_new");
+        check(
+            mem->set_value(0, Value{i}) &&
+                mem->set_value(1, Value{std::string("n") + std::to_string(i)}),
+            "set values");
+        check(mem->update(), "update");
+    }
+    check(mem->record_count() == 4 && !mem->eof(), "four rows");
+    mem->move_first();
+    check(std::get<std::string>(mem->value(1)) == "n1", "first row kept");
+    check(mem->set_filter("id > 1 AND id <= 3") && mem->record_count() == 2 &&
+              std::get<std::int64_t>(mem->value(0)) == 2,
+          "filter with AND");
+    check(mem->set_filter("name = 'N4' OR id = 1") && mem->record_count() == 2,
+          "filter with OR, case-insensitive text");
+    check(mem->set_filter("name like 'n*'") && mem->record_count() == 4,
+          "filter with LIKE");
+    check(!mem->set_filter("nonsense") && mem->record_count() == 4,
+          "bad filter refused");
+    check(mem->set_filter("") && mem->record_count() == 4, "filter removed");
+    check(mem->find("id = 3") && std::get<std::int64_t>(mem->value(0)) == 3,
+          "find");
+    check(mem->find("id = 99") && mem->eof(), "find without a hit is EOF");
+    mem->move_first();
+    check(mem->delete_current() && mem->record_count() == 3 &&
+              std::get<std::int64_t>(mem->value(0)) == 2,
+          "delete leaves the cursor on the next row");
+    mem->add_new();
+    mem->set_value(0, Value{std::int64_t{9}});
+    check(mem->cancel_update() && mem->record_count() == 3,
+          "cancel_update drops the new row");
+    mem->close();
+    check(mem->state() == adStateClosed, "closed");
+    check(!cn.execute("select 1").recordset->editable(),
+          "a query result is read-only");
 
     cn.close();
     check(cn.state() == adStateClosed, "closed again");

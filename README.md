@@ -14,9 +14,8 @@ sqlite.org: `92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30`).
 The C++ core is in place and tested. WFC binds it (src/interpreter/ado_helper.cpp
 and the VB classes in builtin_class_sources.hpp): when a program uses
 `ADODB.Connection` or `ADODB.Command`, `CreateObject` and `As ADODB.*` give the
-SQLite-backed classes in the interpreter and in compiled programs. A program that
-uses only `ADODB.Recordset` (a disconnected recordset with `Fields.Append`) still
-goes to COM until disconnected recordsets are implemented here.
+SQLite-backed classes in the interpreter and in compiled programs. A recordset is
+either a query result (read-only) or built in memory.
 
 | ADODB member | State |
 | --- | --- |
@@ -25,7 +24,7 @@ goes to COM until disconnected recordsets are implemented here.
 | `BeginTrans`, `CommitTrans`, `RollbackTrans` (nested, as savepoints) | done |
 | `Connection.Errors` | done (ADO numbers for syntax errors and constraint violations) |
 | `Recordset` read-only static cursor: `Fields`, `MoveFirst/Last/Next/Previous`, `BOF`, `EOF`, `RecordCount`, `AbsolutePosition` | done |
-| `Recordset.AddNew`, `Update`, `Delete`, `Find`, `Filter`, `Sort` | planned |
+| Disconnected `Recordset` (`Fields.Append`, `AddNew`, `Update`, `CancelUpdate`, `Delete`, `Filter`, `Find`, `GetRows`) | done; `Sort` and writing a query result back to its table are planned |
 | `Command` object, `Parameters`, named parameters | planned |
 | `CreateObject("ADODB.*")` binding in the interpreter and in native programs | done for Connection, Command (`Execute , Array(...)`), read-only Recordset |
 | ADO type mapping beyond Integer, BigInt, Double, VarWChar, LongVarBinary; Date and Boolean | planned |
