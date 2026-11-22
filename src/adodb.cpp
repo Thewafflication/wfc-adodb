@@ -181,28 +181,51 @@ namespace {
     return static_cast<double>(era * 146097 + doe - 719468 + 25569);
 }
 
+// Reads a run of digits from the front of text.
+[[nodiscard]] bool read_number(std::string_view& text, long& out) {
+    std::size_t used = 0;
+    long value = 0;
+    while (used < text.size() && text[used] >= '0' && text[used] <= '9' &&
+           used < 9) {
+        value = value * 10 + (text[used] - '0');
+        ++used;
+    }
+    if (used == 0) {
+        return false;
+    }
+    out = value;
+    text.remove_prefix(used);
+    return true;
+}
+
+[[nodiscard]] bool read_char(std::string_view& text, const char wanted) {
+    if (text.empty() || text.front() != wanted) {
+        return false;
+    }
+    text.remove_prefix(1);
+    return true;
+}
+
 // The text of a #date# literal (M/D/YYYY or YYYY-MM-DD, then an optional time
 // H:MM[:SS] [AM|PM]) as an OLE date; false when it is not one.
 [[nodiscard]] bool parse_date_literal(std::string_view text, double& out) {
     text = trim(text);
-    const auto gap = text.find_first_of(" T");
-    const std::string d(text.substr(0, gap));
-    const std::string t(gap == std::string_view::npos
-                            ? std::string_view{}
-                            : trim(text.substr(gap + 1)));
     long a = 0;
     long b = 0;
     long c = 0;
-    char s1 = 0;
-    char s2 = 0;
-    if (std::sscanf(d.c_str(), "%ld%c%ld%c%ld", &a, &s1, &b, &s2, &c) != 5 ||
-        s1 != s2 || (s1 != '/' && s1 != '-')) {
+    if (!read_number(text, a) || text.empty()) {
+        return false;
+    }
+    const char separator = text.front();
+    if ((separator != '/' && separator != '-') || !read_char(text, separator) ||
+        !read_number(text, b) || !read_char(text, separator) ||
+        !read_number(text, c)) {
         return false;
     }
     long year = c;
     long month = a;
     long day = b;
-    if (s1 == '-' && a > 31) {
+    if (separator == '-' && a > 31) {
         year = a;
         month = b;
         day = c;
@@ -211,21 +234,25 @@ namespace {
         return false;
     }
     double fraction = 0;
-    if (!t.empty()) {
+    text = trim(text);
+    if (!text.empty() && (text.front() == 'T' || text.front() == 'T' + 32)) {
+        text.remove_prefix(1);
+    }
+    if (!text.empty()) {
         long h = 0;
         long m = 0;
         long sec = 0;
-        char tail[8] = {};
-        const int got =
-            std::sscanf(t.c_str(), "%ld:%ld:%ld %7s", &h, &m, &sec, tail);
-        if (got < 3) {
-            sec = 0;
-            tail[0] = 0;
-            if (std::sscanf(t.c_str(), "%ld:%ld %7s", &h, &m, tail) < 2) {
-                return false;
-            }
+        if (!read_number(text, h) || !read_char(text, ':') ||
+            !read_number(text, m)) {
+            return false;
         }
-        const std::string ampm = lower(tail);
+        if (read_char(text, ':') && !read_number(text, sec)) {
+            return false;
+        }
+        const std::string ampm = lower(trim(text));
+        if (!ampm.empty() && ampm != "am" && ampm != "pm") {
+            return false;
+        }
         if (ampm == "pm" && h < 12) {
             h += 12;
         } else if (ampm == "am" && h == 12) {
