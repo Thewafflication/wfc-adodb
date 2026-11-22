@@ -117,6 +117,13 @@ public:
     // fails the change is undone and the error is kept here; taking it clears
     // it.
     [[nodiscard]] bool linked() const noexcept { return link_ != nullptr; }
+    // ADO's EditMode: 0 none, 1 a row being edited, 2 a row being added.
+    [[nodiscard]] int edit_mode() const noexcept {
+        return !pending_ ? 0 : (pending_new_ ? 2 : 1);
+    }
+    // A copy with rows of its own (Recordset.Clone); a pending change is not
+    // carried over.
+    [[nodiscard]] std::shared_ptr<Recordset> clone() const;
     [[nodiscard]] bool take_error(Error& out);
 
     // Filter criteria: field op literal, joined by AND / OR; an empty text

@@ -100,17 +100,94 @@ if(WFC_ADODB_SHARED AND WIN32)
   set(WFC_LIB_NAME wfcadodb)
   set(WFC_LIB_FILE msado15.dll)
   set(WFC_LIB_DESCRIPTION "WFC ADODB")
+  # The type library: midl compiles src/adodb.idl; the .tlb goes into the DLL
+  # as a resource and adodb_i.c holds the interface ids the objects answer to.
+  # midl.exe and the headers it imports come with the Windows SDK.
+  cmake_host_system_information(
+    RESULT wfc_kits
+    QUERY WINDOWS_REGISTRY "HKLM/SOFTWARE/Microsoft/Windows Kits/Installed Roots"
+    VALUE KitsRoot10
+    VIEW BOTH
+    ERROR_VARIABLE wfc_kits_error
+  )
+  if(NOT wfc_kits)
+    set(wfc_kits "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/")
+  endif()
+  string(REGEX REPLACE "[/\\\\]+$" "" wfc_kits "${wfc_kits}")
+  file(TO_CMAKE_PATH "${wfc_kits}" wfc_kits)
+  if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+    set(wfc_kit_version "${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
+  elseif(DEFINED ENV{WindowsSDKVersion})
+    string(REGEX REPLACE "[/\\\\]+$" "" wfc_kit_version
+           "$ENV{WindowsSDKVersion}")
+  else()
+    file(GLOB wfc_kit_versions LIST_DIRECTORIES true
+         "${wfc_kits}/Include/10.*")
+    list(SORT wfc_kit_versions)
+    list(POP_BACK wfc_kit_versions wfc_kit_latest)
+    get_filename_component(wfc_kit_version "${wfc_kit_latest}" NAME)
+  endif()
+  find_program(
+    WFC_MIDL midl
+    HINTS
+      "${wfc_kits}/bin/${wfc_kit_version}/x64"
+      "${wfc_kits}/bin/${wfc_kit_version}/arm64"
+      "${wfc_kits}/bin/${wfc_kit_version}/x86"
+  )
+  if(NOT WFC_MIDL)
+    message(FATAL_ERROR "midl.exe (Windows SDK) is needed for msado15.dll")
+  endif()
+  if(CMAKE_VS_PLATFORM_NAME)
+    set(wfc_midl_platform "${CMAKE_VS_PLATFORM_NAME}")
+  else()
+    set(wfc_midl_platform "${CMAKE_SYSTEM_PROCESSOR}")
+  endif()
+  string(TOLOWER "${wfc_midl_platform}" wfc_midl_platform)
+  if(wfc_midl_platform MATCHES "arm64")
+    set(wfc_midl_env arm64)
+  elseif(wfc_midl_platform MATCHES "win32|x86|i386|i686")
+    set(wfc_midl_env win32)
+  else()
+    set(wfc_midl_env x64)
+  endif()
+  set(wfc_midl_includes
+    /I "${wfc_kits}/Include/${wfc_kit_version}/um"
+    /I "${wfc_kits}/Include/${wfc_kit_version}/shared"
+  )
+  set(wfc_tlb "${CMAKE_CURRENT_BINARY_DIR}/adodb.tlb")
+  set(wfc_iid "${CMAKE_CURRENT_BINARY_DIR}/adodb_i.c")
+  add_custom_command(
+    OUTPUT "${wfc_tlb}" "${wfc_iid}"
+    COMMAND
+      "${WFC_MIDL}" /nologo /env ${wfc_midl_env} ${wfc_midl_includes} /tlb
+      "${wfc_tlb}" /h nul /iid "${wfc_iid}" /proxy nul /dlldata nul /out
+      "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/src/adodb.idl"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/adodb.idl"
+    COMMENT "midl adodb.idl"
+    VERBATIM
+  )
+  set(WFC_LIB_RC_EXTRA "1 TYPELIB \"${wfc_tlb}\"")
   configure_file(
     version.rc.in
     "${CMAKE_CURRENT_BINARY_DIR}/wfcadodb.rc"
     @ONLY
   )
+  set_source_files_properties(
+    "${CMAKE_CURRENT_BINARY_DIR}/wfcadodb.rc"
+    PROPERTIES OBJECT_DEPENDS "${wfc_tlb}"
+  )
   add_library(
     wfc_adodb_dll
     SHARED
     src/registration.cpp
-    src/com/classes.cpp
+    src/com/common.cpp
+    src/com/connection.cpp
+    src/com/recordset.cpp
+    src/com/command.cpp
+    src/com/stream.cpp
+    src/com/persist.cpp
     src/adodb.def
+    "${wfc_iid}"
     "${CMAKE_CURRENT_BINARY_DIR}/wfcadodb.rc"
   )
   target_include_directories(
@@ -119,7 +196,7 @@ if(WFC_ADODB_SHARED AND WIN32)
   )
   target_link_libraries(
     wfc_adodb_dll
-    PRIVATE wfc_adodb advapi32 ole32 oleaut32
+    PRIVATE wfc_adodb advapi32 ole32 oleaut32 rpcrt4
   )
   set_target_properties(
     wfc_adodb_dll

@@ -56,6 +56,15 @@ VARIANT real(const double value) {
     return v;
 }
 
+// An argument the program left out.
+VARIANT nothing() {
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_ERROR;
+    v.scode = DISP_E_PARAMNOTFOUND;
+    return v;
+}
+
 // A reference to an object as an argument (the call releases it).
 VARIANT object_var(IDispatch* object) {
     VARIANT v;
@@ -156,6 +165,42 @@ IDispatch* as_object(Outcome& out) {
     IDispatch* object = out.value.pdispVal;
     object->AddRef();
     return object;
+}
+
+// The type information of an object lists every member of its dispinterface;
+// each one must be answered by the object under the same DISPID.
+void check_members(IDispatch* object, const char* label) {
+    UINT infos = 0;
+    object->GetTypeInfoCount(&infos);
+    check(infos == 1, label);
+    ITypeInfo* info = nullptr;
+    if (FAILED(object->GetTypeInfo(0, LOCALE_USER_DEFAULT, &info))) {
+        check(false, label);
+        return;
+    }
+    TYPEATTR* attr = nullptr;
+    info->GetTypeAttr(&attr);
+    int missing = 0;
+    for (UINT f = 0; f < attr->cFuncs; ++f) {
+        FUNCDESC* fd = nullptr;
+        info->GetFuncDesc(f, &fd);
+        BSTR name = nullptr;
+        info->GetDocumentation(fd->memid, &name, nullptr, nullptr, nullptr);
+        DISPID id = 0;
+        LPOLESTR names[1] = {name};
+        const HRESULT hr =
+            object->GetIDsOfNames(IID_NULL, names, 1, LOCALE_USER_DEFAULT, &id);
+        if (FAILED(hr) || id != fd->memid) {
+            std::wcerr << L"member not answered: " << label << L"."
+                       << (name != nullptr ? name : L"?") << L'\n';
+            ++missing;
+        }
+        SysFreeString(name);
+        info->ReleaseFuncDesc(fd);
+    }
+    info->ReleaseTypeAttr(attr);
+    info->Release();
+    check(missing == 0, label);
 }
 
 IDispatch* create(const wchar_t* progid) {
@@ -414,6 +459,238 @@ int main(int argc, char** argv) {
         check(bad.hr == DISP_E_EXCEPTION &&
                   bad.exception.scode == static_cast<SCODE>(-2147217900L),
               "a syntax error is DB_E_ERRORSINCOMMAND");
+    }
+
+    // The type library is registered, and every class has its type
+    // information with all the members of the dispinterface.
+    {
+        ITypeLib* library = nullptr;
+        check(SUCCEEDED(LoadRegTypeLib(
+                  {0xA5626876,
+                   0x1B8D,
+                   0x53E5,
+                   {0x9D, 0x50, 0x95, 0x5E, 0x6A, 0xEB, 0x09, 0x5C}},
+                  6, 1, 0, &library)),
+              "the type library is registered");
+        if (library != nullptr) {
+            library->Release();
+        }
+        check_members(connection, "Connection");
+        Outcome errors = call(connection, L"Errors");
+        IDispatch* list = as_object(errors);
+        check(list != nullptr, "Errors");
+        if (list != nullptr) {
+            check_members(list, "Errors");
+            list->Release();
+        }
+        Outcome properties = call(connection, L"Properties");
+        IDispatch* props = as_object(properties);
+        check(props != nullptr && as_long(call(props, L"Count")) >= 1,
+              "Properties holds some properties");
+        if (props != nullptr) {
+            check_members(props, "Properties");
+            Outcome item = call(props, L"Item", {number(0)});
+            IDispatch* property = as_object(item);
+            check(property != nullptr, "Properties.Item");
+            if (property != nullptr) {
+                check_members(property, "Property");
+                property->Release();
+            }
+            props->Release();
+        }
+        for (const wchar_t* progid :
+             {L"WFC.ADODB.Recordset", L"WFC.ADODB.Command",
+              L"WFC.ADODB.Parameter", L"WFC.ADODB.Record",
+              L"WFC.ADODB.Stream"}) {
+            IDispatch* made = create(progid);
+            check(made != nullptr, "every class is created through COM");
+            if (made != nullptr) {
+                check_members(made, "created class");
+                made->Release();
+            }
+        }
+    }
+
+    // Errors: a failed call leaves its error in the collection.
+    {
+        call(connection, L"Execute", {text(L"selec nothing")});
+        Outcome errors = call(connection, L"Errors");
+        IDispatch* list = as_object(errors);
+        check(list != nullptr && as_long(call(list, L"Count")) == 1,
+              "Errors.Count after a failure");
+        if (list != nullptr) {
+            Outcome item = call(list, L"Item", {number(0)});
+            IDispatch* error = as_object(item);
+            check(error != nullptr &&
+                      as_long(call(error, L"Number")) == -2147217900L,
+                  "Errors(0).Number");
+            if (error != nullptr) {
+                check_members(error, "Error");
+                check(!as_text(call(error, L"Description")).empty(),
+                      "Errors(0).Description");
+                error->Release();
+            }
+            check(call(list, L"Clear").hr == S_OK &&
+                      as_long(call(list, L"Count")) == 0,
+                  "Errors.Clear");
+            list->Release();
+        }
+    }
+
+    // Recordset members that were missing: Clone, Requery, EditMode, Status,
+    // Supports, paging, GetRows, Find, Save and Open of a file.
+    {
+        Outcome made = call(connection, L"Execute",
+                            {text(L"select id, name from t order by id")});
+        IDispatch* rs = as_object(made);
+        check(rs != nullptr, "Execute for the member checks");
+        if (rs != nullptr) {
+            check_members(rs, "Recordset");
+            check(as_long(call(rs, L"PageCount")) == 1 &&
+                      as_long(call(rs, L"AbsolutePage")) == 1,
+                  "PageCount, AbsolutePage");
+            check(as_long(call(rs, L"EditMode")) == 0, "EditMode none");
+            check(call(rs, L"Supports", {number(0x2000)}).value.boolVal ==
+                      VARIANT_TRUE,
+                  "Supports adBookmark");
+            Outcome copy = call(rs, L"Clone");
+            IDispatch* twin = as_object(copy);
+            check(twin != nullptr && as_long(call(twin, L"RecordCount")) ==
+                                         as_long(call(rs, L"RecordCount")),
+                  "Clone");
+            if (twin != nullptr) {
+                check(call(twin, L"MoveLast").hr == S_OK &&
+                          as_long(call(rs, L"AbsolutePosition")) == 1,
+                      "a clone moves on its own");
+                twin->Release();
+            }
+            Outcome rows = call(rs, L"GetRows", {number(2)});
+            check(rows.hr == S_OK && rows.value.vt == (VT_ARRAY | VT_VARIANT),
+                  "GetRows");
+            call(rs, L"MoveFirst");
+            check(call(rs, L"Find", {text(L"name = 'bob'")}).hr == S_OK &&
+                      as_text(call(rs, L"Collect", {text(L"name")})) == L"bob",
+                  "Find");
+            check(call(rs, L"Requery").hr == S_OK &&
+                      as_long(call(rs, L"RecordCount")) >= 2,
+                  "Requery");
+            // Save and open the file again.
+            wchar_t folder[MAX_PATH];
+            GetTempPathW(MAX_PATH, folder);
+            const std::wstring file =
+                std::wstring(folder) + L"wfc-adodb-test-" +
+                std::to_wstring(GetCurrentProcessId()) + L".xml";
+            check(call(rs, L"Save", {text(file.c_str())}).hr == S_OK,
+                  "Save to a file");
+            rs->Release();
+            IDispatch* loaded = create(L"WFC.ADODB.Recordset");
+            check(loaded != nullptr && call(loaded, L"Open",
+                                            {text(file.c_str()), nothing(),
+                                             number(0), number(3), number(256)})
+                                               .hr == S_OK,
+                  "Open from a file");
+            if (loaded != nullptr) {
+                check(as_long(call(loaded, L"RecordCount")) >= 2,
+                      "the saved rows come back");
+                check(as_text(call(loaded, L"Collect", {text(L"name")})) !=
+                          L"<not text>",
+                      "the saved values come back");
+                loaded->Release();
+            }
+            DeleteFileW(file.c_str());
+        }
+    }
+
+    // OpenSchema.
+    {
+        Outcome tables = call(connection, L"OpenSchema", {number(20)});
+        IDispatch* rs = as_object(tables);
+        check(rs != nullptr && as_long(call(rs, L"RecordCount")) >= 1 &&
+                  as_text(call(rs, L"Collect", {text(L"TABLE_NAME")})) == L"t",
+              "OpenSchema(adSchemaTables)");
+        if (rs != nullptr) {
+            rs->Release();
+        }
+        Outcome columns = call(connection, L"OpenSchema", {number(4)});
+        IDispatch* cs = as_object(columns);
+        check(cs != nullptr && as_long(call(cs, L"RecordCount")) >= 3,
+              "OpenSchema(adSchemaColumns)");
+        if (cs != nullptr) {
+            cs->Release();
+        }
+    }
+
+    // Stream.
+    {
+        IDispatch* stream = create(L"WFC.ADODB.Stream");
+        check(stream != nullptr, "ADODB.Stream is created");
+        if (stream != nullptr) {
+            check(error_number(call(stream, L"WriteText", {text(L"x")})) ==
+                      static_cast<long>(0x800A0000UL | 3704),
+                  "a closed Stream refuses writes");
+            check(call(stream, L"Open").hr == S_OK, "Stream.Open");
+            check(put(stream, L"Charset", text(L"utf-8")) == S_OK,
+                  "Stream.Charset");
+            check(
+                call(stream, L"WriteText", {text(L"one"), number(1)}).hr ==
+                        S_OK &&
+                    call(stream, L"WriteText", {text(L"two"), number(1)}).hr ==
+                        S_OK,
+                "Stream.WriteText lines");
+            check(put(stream, L"Position", number(0)) == S_OK,
+                  "Stream.Position");
+            check(as_text(call(stream, L"ReadText", {number(-2)})) == L"one",
+                  "Stream.ReadText a line");
+            check(as_text(call(stream, L"ReadText")) == L"two\r\n",
+                  "Stream.ReadText the rest");
+            check(call(stream, L"EOS").value.boolVal == VARIANT_TRUE,
+                  "Stream.EOS");
+            wchar_t folder[MAX_PATH];
+            GetTempPathW(MAX_PATH, folder);
+            const std::wstring file =
+                std::wstring(folder) + L"wfc-adodb-stream-" +
+                std::to_wstring(GetCurrentProcessId()) + L".txt";
+            check(call(stream, L"SaveToFile", {text(file.c_str()), number(2)})
+                          .hr == S_OK,
+                  "Stream.SaveToFile");
+            check(call(stream, L"Close").hr == S_OK, "Stream.Close");
+            check(call(stream, L"Open").hr == S_OK &&
+                      call(stream, L"LoadFromFile", {text(file.c_str())}).hr ==
+                          S_OK &&
+                      as_long(call(stream, L"Size")) > 6,
+                  "Stream.LoadFromFile");
+            check_members(stream, "Stream");
+            stream->Release();
+            DeleteFileW(file.c_str());
+        }
+    }
+
+    // Record: the current row of a recordset.
+    {
+        Outcome made =
+            call(connection, L"Execute", {text(L"select id, name from t")});
+        IDispatch* rs = as_object(made);
+        IDispatch* record = create(L"WFC.ADODB.Record");
+        check(rs != nullptr && record != nullptr, "Record and Recordset");
+        if (rs != nullptr && record != nullptr) {
+            check(call(record, L"Open", {object_var(rs)}).hr == S_OK,
+                  "Record.Open on a recordset");
+            Outcome fields = call(record, L"Fields");
+            IDispatch* list = as_object(fields);
+            check(list != nullptr && as_long(call(list, L"Count")) == 2,
+                  "Record.Fields");
+            if (list != nullptr) {
+                list->Release();
+            }
+            check(as_long(call(record, L"State")) == 1, "Record.State");
+            check_members(record, "Record");
+        }
+        if (record != nullptr) {
+            record->Release();
+        }
+        if (rs != nullptr) {
+            rs->Release();
+        }
     }
 
     check(call(connection, L"Close").hr == S_OK, "Close the connection");

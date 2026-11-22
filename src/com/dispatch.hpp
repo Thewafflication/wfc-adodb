@@ -23,7 +23,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <new>
@@ -119,11 +121,21 @@ public:
             SysAllocStringLen(wide.data(), static_cast<UINT>(wide.size()));
     }
     // Takes a reference to the object.
-    void set_object(IDispatch* object) {
+    void set_object(IUnknown* object) {
         VariantClear(&value_);
-        value_.vt = VT_DISPATCH;
-        value_.pdispVal = object;
-        if (object != nullptr) {
+        if (object == nullptr) {
+            value_.vt = VT_DISPATCH;
+            value_.pdispVal = nullptr;
+            return;
+        }
+        IDispatch* dispatch = nullptr;
+        if (SUCCEEDED(object->QueryInterface(
+                IID_IDispatch, reinterpret_cast<void**>(&dispatch)))) {
+            value_.vt = VT_DISPATCH;
+            value_.pdispVal = dispatch;
+        } else {
+            value_.vt = VT_UNKNOWN;
+            value_.punkVal = object;
             object->AddRef();
         }
     }
@@ -153,13 +165,6 @@ private:
     }
     return variant.vt == (VT_BYREF | VT_VARIANT) &&
            variant.pvarVal != nullptr && variant.pvarVal->vt == VT_ERROR;
-}
-
-[[nodiscard]] inline bool is_nothing(const VARIANT& variant) {
-    const Var plain = dereferenced(variant);
-    return plain.ref().vt == VT_EMPTY || plain.ref().vt == VT_NULL ||
-           ((plain.ref().vt == VT_DISPATCH || plain.ref().vt == VT_UNKNOWN) &&
-            plain.ref().pdispVal == nullptr);
 }
 
 [[nodiscard]] inline Value to_value(const VARIANT& variant) {
@@ -344,15 +349,19 @@ inline void from_value(const Value& value, const int type, Var& out) {
 // ----- the call as a member sees it ----------------------------------------
 
 struct Call {
-    // The arguments in the order the program wrote them.
+    // The arguments in the order the program wrote them; for a property put
+    // the new value is the last one.
     std::vector<VARIANT> args;
     bool is_put{false};
+    bool putref{false};
     VARIANT* result{nullptr};
 
     [[nodiscard]] std::size_t count() const noexcept { return args.size(); }
     [[nodiscard]] bool has(const std::size_t index) const noexcept {
         return index < args.size() && !is_missing(args[index]);
     }
+    // The new value of a property put.
+    [[nodiscard]] const VARIANT& value() const { return args.back(); }
     [[nodiscard]] long to_long(const std::size_t index,
                                const long fallback) const {
         if (!has(index)) {
@@ -388,8 +397,8 @@ struct Call {
         }
         return {};
     }
-    // The object in an argument (an IDispatch), or null.
-    [[nodiscard]] IDispatch* object(const std::size_t index) const {
+    // The object in an argument (an IUnknown, not owned), or null.
+    [[nodiscard]] IUnknown* object(const std::size_t index) const {
         if (index >= args.size()) {
             return nullptr;
         }
@@ -398,7 +407,7 @@ struct Call {
             v = v->pvarVal;
         }
         if (v->vt == VT_DISPATCH || v->vt == VT_UNKNOWN) {
-            return v->pdispVal;
+            return v->punkVal;
         }
         if (v->vt == (VT_BYREF | VT_DISPATCH) && v->ppdispVal != nullptr) {
             return *v->ppdispVal;
@@ -419,6 +428,19 @@ struct Call {
             VariantClear(result);
             result->vt = VT_I4;
             result->lVal = number;
+        }
+    }
+    void put_byte(const unsigned char number) const {
+        if (result != nullptr) {
+            VariantClear(result);
+            result->vt = VT_UI1;
+            result->bVal = number;
+        }
+    }
+    void put_null() const {
+        if (result != nullptr) {
+            VariantClear(result);
+            result->vt = VT_NULL;
         }
     }
     void put_bool(const bool flag) const {
@@ -442,14 +464,13 @@ struct Call {
             VariantCopy(result, const_cast<VARIANT*>(&value.ref()));
         }
     }
-    void put_object(IDispatch* object) const {
+    // An object (or null), as a VT_DISPATCH the caller owns.
+    void put_object(IUnknown* object) const {
         if (result != nullptr) {
+            Var v;
+            v.set_object(object);
             VariantClear(result);
-            result->vt = VT_DISPATCH;
-            result->pdispVal = object;
-            if (object != nullptr) {
-                object->AddRef();
-            }
+            VariantCopy(result, v.get());
         }
     }
 };
@@ -460,29 +481,67 @@ template <class Self>
 struct MemberEntry {
     const wchar_t* name;
     DISPID id;
-    void (*get)(Self&, Call&);  // a property read or a method
-    void (*put)(Self&, Call&);  // a property write, or null
+    std::function<void(Self&, Call&)> get;  // a property read or a method
+    std::function<void(Self&, Call&)> put;  // a property write, or empty
     // rs.Fields("name"): arguments given to a property that takes none go to
     // the default member of the object it returns.
     bool forward{false};
 };
 
-// A COM object whose members come from Self::members().
 template <class Self>
-class DispatchObject : public IDispatch {
+using Table = std::vector<MemberEntry<Self>>;
+
+// The type library of the DLL (the dispinterfaces of adodb.idl), loaded the
+// first time an object is asked for its type information; null when it cannot
+// be loaded.
+ITypeLib* type_library();
+
+// What every object of ours can be asked, so one object finds the native data
+// of another (a Recordset opened on a Connection object).
+class ObjectBase {
+public:
+    [[nodiscard]] virtual const void* tag() const noexcept = 0;
+
+protected:
+    ~ObjectBase() = default;
+};
+
+constexpr GUID kPrivateObject = {
+    0x6f0b0b5a,
+    0x2c1e,
+    0x4d7a,
+    {0x9a, 0x01, 0x57, 0x6e, 0xa5, 0x0c, 0x11, 0x7f}};
+
+// A COM object whose members come from Self::members() and whose type
+// information is the dispinterface Self::iid() of the type library.
+template <class Self>
+class DispatchObject : public IDispatch, public ObjectBase {
 public:
     DispatchObject() { ++g_objects; }
     DispatchObject(const DispatchObject&) = delete;
     DispatchObject& operator=(const DispatchObject&) = delete;
     virtual ~DispatchObject() { --g_objects; }
 
+    static const void* static_tag() noexcept {
+        static const char tag = 0;
+        return &tag;
+    }
+    [[nodiscard]] const void* tag() const noexcept override {
+        return static_tag();
+    }
+
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,
                                              void** object) override {
         if (object == nullptr) {
             return E_POINTER;
         }
-        if (iid == IID_IUnknown || iid == IID_IDispatch) {
+        if (iid == IID_IUnknown || iid == IID_IDispatch || iid == Self::iid()) {
             *object = static_cast<IDispatch*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (iid == kPrivateObject) {
+            *object = static_cast<ObjectBase*>(this);
             AddRef();
             return S_OK;
         }
@@ -500,12 +559,24 @@ public:
 
     HRESULT STDMETHODCALLTYPE GetTypeInfoCount(UINT* count) override {
         if (count != nullptr) {
-            *count = 0;
+            *count = type_library() != nullptr ? 1U : 0U;
         }
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE GetTypeInfo(UINT, LCID, ITypeInfo**) override {
-        return E_NOTIMPL;
+    HRESULT STDMETHODCALLTYPE GetTypeInfo(UINT index, LCID,
+                                          ITypeInfo** info) override {
+        if (info == nullptr) {
+            return E_POINTER;
+        }
+        *info = nullptr;
+        if (index != 0) {
+            return DISP_E_BADINDEX;
+        }
+        ITypeLib* library = type_library();
+        if (library == nullptr) {
+            return E_NOTIMPL;
+        }
+        return library->GetTypeInfoOfGuid(Self::iid(), info);
     }
     HRESULT STDMETHODCALLTYPE GetIDsOfNames(REFIID, LPOLESTR* names, UINT count,
                                             LCID, DISPID* ids) override {
@@ -533,6 +604,8 @@ public:
     HRESULT STDMETHODCALLTYPE Invoke(DISPID id, REFIID, LCID lcid, WORD flags,
                                      DISPPARAMS* params, VARIANT* result,
                                      EXCEPINFO* exception, UINT*) override {
+        const bool wants_put =
+            (flags & (DISPATCH_PROPERTYPUT | DISPATCH_PROPERTYPUTREF)) != 0;
         const MemberEntry<Self>* entry = nullptr;
         for (const auto& candidate : Self::members()) {
             if (candidate.id == id) {
@@ -543,31 +616,25 @@ public:
         if (entry == nullptr) {
             return DISP_E_MEMBERNOTFOUND;
         }
-        const bool wants_put =
-            (flags & (DISPATCH_PROPERTYPUT | DISPATCH_PROPERTYPUTREF)) != 0;
+        const auto& handler = wants_put ? entry->put : entry->get;
+        if (!handler) {
+            return DISP_E_MEMBERNOTFOUND;
+        }
         Call call;
         call.is_put = wants_put;
+        call.putref = (flags & DISPATCH_PROPERTYPUTREF) != 0;
         call.result = result;
-        UINT total = params != nullptr ? params->cArgs : 0;
-        // The arguments arrive last first; a put also carries the new value
-        // as a named argument.
+        const UINT total = params != nullptr ? params->cArgs : 0;
+        // The arguments arrive last first; the new value of a put is a named
+        // argument and arrives first, so it ends up the last element here.
         for (UINT i = total; i > 0; --i) {
             call.args.push_back(params->rgvarg[i - 1]);
-        }
-        if (wants_put) {
-            // The new value arrives first, so it is the last element here.
-            if (entry->put == nullptr) {
-                return DISP_E_MEMBERNOTFOUND;
-            }
-        } else if (entry->get == nullptr) {
-            return DISP_E_MEMBERNOTFOUND;
         }
         if (result != nullptr) {
             VariantInit(result);
         }
         try {
-            (wants_put ? entry->put : entry->get)(static_cast<Self&>(*this),
-                                                  call);
+            handler(static_cast<Self&>(*this), call);
         } catch (const ComError& error) {
             return raise(exception, error);
         } catch (const std::bad_alloc&) {
@@ -676,6 +743,74 @@ private:
     std::size_t position_{0};
     std::atomic<long> references_{1};
 };
+
+// The enumerator a collection's _NewEnum returns.
+inline void put_enumerator(Call& call, std::vector<Var> items) {
+    auto* enumerator = new Enumerator(std::move(items));
+    if (call.result != nullptr) {
+        call.result->vt = VT_UNKNOWN;
+        call.result->punkVal = enumerator;
+    } else {
+        enumerator->Release();
+    }
+}
+
+// ----- table helpers --------------------------------------------------------
+
+template <class Self>
+[[nodiscard]] std::function<void(Self&, Call&)> read_long(long Self::* member) {
+    return [member](Self& s, Call& c) {
+        c.put_long(s.*member);
+    };
+}
+template <class Self>
+[[nodiscard]] std::function<void(Self&, Call&)> write_long(
+    long Self::* member, const long fallback = 0) {
+    return [member, fallback](Self& s, Call& c) {
+        s.*member = c.to_long(c.count() - 1, fallback);
+    };
+}
+template <class Self>
+[[nodiscard]] std::function<void(Self&, Call&)> read_text(
+    std::string Self::* member) {
+    return [member](Self& s, Call& c) {
+        c.put_text(s.*member);
+    };
+}
+template <class Self>
+[[nodiscard]] std::function<void(Self&, Call&)> write_text(
+    std::string Self::* member) {
+    return [member](Self& s, Call& c) {
+        s.*member = c.to_text(c.count() - 1);
+    };
+}
+template <class Self>
+[[nodiscard]] std::function<void(Self&, Call&)> read_bool(bool Self::* member) {
+    return [member](Self& s, Call& c) {
+        c.put_bool(s.*member);
+    };
+}
+template <class Self>
+[[nodiscard]] std::function<void(Self&, Call&)> write_bool(
+    bool Self::* member) {
+    return [member](Self& s, Call& c) {
+        s.*member =
+            c.to_long(c.count() - 1, 0) != 0 ||
+            (c.value().vt == VT_BOOL && c.value().boolVal != VARIANT_FALSE);
+    };
+}
+template <class Self>
+[[nodiscard]] std::function<void(Self&, Call&)> read_var(Var Self::* member) {
+    return [member](Self& s, Call& c) {
+        c.put_var(s.*member);
+    };
+}
+template <class Self>
+[[nodiscard]] std::function<void(Self&, Call&)> write_var(Var Self::* member) {
+    return [member](Self& s, Call& c) {
+        s.*member = dereferenced(c.value());
+    };
+}
 
 }  // namespace wfc::adodb::com
 

@@ -523,6 +523,27 @@ bool Recordset::set_value(const std::size_t index, Value value) {
     return true;
 }
 
+std::shared_ptr<Recordset> Recordset::clone() const {
+    auto copy = std::make_shared<Recordset>(*this);
+    if (pending_) {
+        // The row as it was before the edit; a new row is left out.
+        if (pending_new_) {
+            copy->rows_.pop_back();
+            copy->ids_.pop_back();
+            copy->keys_.pop_back();
+        } else if (!bof() && !eof()) {
+            copy->rows_[view_[static_cast<std::size_t>(position_)]] = saved_;
+        }
+        copy->pending_ = false;
+        copy->pending_new_ = false;
+        copy->saved_.clear();
+        copy->rebuild_view();
+        copy->position_ = 0;
+    }
+    copy->has_error_ = false;
+    return copy;
+}
+
 bool Recordset::take_error(Error& out) {
     if (!has_error_) {
         return false;
