@@ -148,10 +148,14 @@ public:
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
 
-    // ConnectionString: "Data Source=path" or "Database=path" or "File
-    // Name=path" (other keys, among them Provider and Driver, are accepted and
-    // ignored). A bare string with no "=" is taken as the path. ":memory:"
-    // opens a private in-memory database. Returns false and fills errors() on
+    // ConnectionString: a string with a DSN, FILEDSN or Driver key (or
+    // Provider=MSDASQL) goes to the ODBC driver manager, so any database with
+    // an ODBC driver works (Windows only for now). Otherwise SQLite: "Data
+    // Source=path" or "Database=path" or "File Name=path" (other keys,
+    // among them Provider, are accepted and ignored); a bare string with no
+    // "=" is taken as the path; ":memory:" opens a private in-memory
+    // database. Under ODBC the SQL is the database's own, BeginTrans does not
+    // nest and last_insert_id is 0. Returns false and fills errors() on
     // failure.
     bool open(std::string_view connection_string);
     void close() noexcept;

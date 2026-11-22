@@ -39,9 +39,12 @@ if(NOT WIN32)
   target_link_libraries(wfc_adodb_sqlite PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 endif()
 
-add_library(wfc_adodb STATIC src/adodb.cpp)
+add_library(wfc_adodb STATIC src/adodb.cpp src/odbc.cpp)
 target_include_directories(wfc_adodb PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(wfc_adodb PUBLIC wfc_adodb_sqlite)
+if(WIN32)
+  target_link_libraries(wfc_adodb PUBLIC odbc32)
+endif()
 target_compile_features(wfc_adodb PUBLIC cxx_std_20)
 set_target_properties(wfc_adodb PROPERTIES OUTPUT_NAME wfcadodb_static)
 if(COMMAND wfc_enable_strict_warnings)
@@ -57,6 +60,25 @@ if(BUILD_TESTING AND WFC_BUILD_TESTS)
   if(COMMAND wfc_enable_strict_warnings)
     wfc_enable_strict_warnings(adodb_test)
   endif()
+  add_executable(adodb_odbc_test tests/adodb_odbc_test.cpp)
+  target_link_libraries(adodb_odbc_test PRIVATE wfc_adodb)
+  if(WIN32)
+    target_link_libraries(
+      adodb_odbc_test
+      PRIVATE odbccp32 legacy_stdio_definitions
+    )
+  endif()
+  if(COMMAND wfc_enable_strict_warnings)
+    wfc_enable_strict_warnings(adodb_odbc_test)
+  endif()
+  add_test(
+    NAME ${WFC_ADODB_TEST_PREFIX}TC-0002-adodb-odbc
+    COMMAND adodb_odbc_test
+  )
+  set_tests_properties(
+    ${WFC_ADODB_TEST_PREFIX}TC-0002-adodb-odbc
+    PROPERTIES LABELS "unit;adodb;odbc" TIMEOUT 120
+  )
   add_test(NAME ${WFC_ADODB_TEST_PREFIX}TC-0001-adodb COMMAND adodb_test)
   set_tests_properties(
     ${WFC_ADODB_TEST_PREFIX}TC-0001-adodb

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <utility>
 
+#include "odbc.hpp"
 #include "sqlite3.h"
 
 namespace wfc::adodb {
@@ -509,7 +510,8 @@ bool Recordset::find(const std::string_view criteria, const long skip,
 
 struct Connection::Impl {
     sqlite3* db{nullptr};
-    int depth{0};  // open BeginTrans levels
+    int depth{0};                               // open BeginTrans levels
+    std::unique_ptr<detail::OdbcSession> odbc;  // set when ODBC is the backend
 };
 
 Connection::Connection() : impl_(std::make_unique<Impl>()) {}
@@ -523,13 +525,22 @@ void Connection::fail(const long number, std::string description) {
 }
 
 int Connection::state() const noexcept {
-    return impl_->db != nullptr ? adStateOpen : adStateClosed;
+    return impl_->db != nullptr || impl_->odbc != nullptr ? adStateOpen
+                                                          : adStateClosed;
 }
 
 bool Connection::open(const std::string_view connection_string) {
-    if (impl_->db != nullptr) {
+    if (state() == adStateOpen) {
         fail(kAlreadyOpen, "Operation is not allowed when the object is open.");
         return false;
+    }
+    if (detail::wants_odbc(connection_string)) {
+        auto session = std::make_unique<detail::OdbcSession>();
+        if (!session->connect(connection_string, errors_)) {
+            return false;
+        }
+        impl_->odbc = std::move(session);
+        return true;
     }
     const std::string path = connection_string_path(connection_string);
     if (path.empty()) {
@@ -553,6 +564,11 @@ bool Connection::open(const std::string_view connection_string) {
 }
 
 void Connection::close() noexcept {
+    if (impl_->odbc != nullptr) {
+        impl_->odbc->disconnect();
+        impl_->odbc.reset();
+        return;
+    }
     if (impl_->db == nullptr) {
         return;
     }
@@ -564,16 +580,39 @@ void Connection::close() noexcept {
 }
 
 std::string Connection::version() const {
+    if (impl_->odbc != nullptr) {
+        return impl_->odbc->version();
+    }
     return sqlite3_libversion();
 }
 
 std::int64_t Connection::last_insert_id() const noexcept {
+    // ODBC has no portable way to ask; a program reads @@IDENTITY itself.
     return impl_->db != nullptr ? sqlite3_last_insert_rowid(impl_->db) : 0;
 }
 
 Result Connection::execute(const std::string_view sql,
                            const std::vector<Value>& params) {
     Result result;
+    if (impl_->odbc != nullptr) {
+        detail::OdbcTable table;
+        if (!impl_->odbc->execute(sql, params, table, errors_)) {
+            return result;
+        }
+        result.ok = true;
+        if (table.columns) {
+            auto set = std::make_shared<Recordset>();
+            set->fields_ = std::move(table.fields);
+            set->rows_ = std::move(table.rows);
+            set->state_ = adStateOpen;
+            set->rebuild_view();
+            result.recordset = std::move(set);
+            result.records_affected = -1;
+        } else {
+            result.records_affected = table.affected;
+        }
+        return result;
+    }
     if (impl_->db == nullptr) {
         fail(kNotOpen, "Operation is not allowed when the object is closed.");
         return result;
@@ -699,6 +738,9 @@ Result Connection::execute(const std::string_view sql,
 }
 
 int Connection::begin_trans() {
+    if (impl_->odbc != nullptr) {
+        return impl_->odbc->begin(errors_);
+    }
     if (impl_->db == nullptr) {
         fail(kNotOpen, "Operation is not allowed when the object is closed.");
         return 0;
@@ -715,6 +757,9 @@ int Connection::begin_trans() {
 }
 
 bool Connection::commit_trans() {
+    if (impl_->odbc != nullptr) {
+        return impl_->odbc->end(true, errors_);
+    }
     if (impl_->db == nullptr || impl_->depth == 0) {
         fail(kNotOpen, "No transaction is active.");
         return false;
@@ -730,6 +775,9 @@ bool Connection::commit_trans() {
 }
 
 bool Connection::rollback_trans() {
+    if (impl_->odbc != nullptr) {
+        return impl_->odbc->end(false, errors_);
+    }
     if (impl_->db == nullptr || impl_->depth == 0) {
         fail(kNotOpen, "No transaction is active.");
         return false;
