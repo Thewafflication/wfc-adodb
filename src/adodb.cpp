@@ -294,6 +294,7 @@ bool Recordset::open_empty() {
     }
     state_ = adStateOpen;
     rows_.clear();
+    ids_.clear();
     view_.clear();
     position_ = 0;
     return true;
@@ -353,6 +354,7 @@ void Recordset::close() noexcept {
     state_ = adStateClosed;
     fields_.clear();
     rows_.clear();
+    ids_.clear();
     view_.clear();
     filter_.clear();
     sort_.clear();
@@ -373,6 +375,7 @@ bool Recordset::add_new() {
     }
     static_cast<void>(update());
     rows_.emplace_back(fields_.size());
+    ids_.push_back(++next_id_);
     view_.push_back(rows_.size() - 1);
     position_ = static_cast<long>(view_.size()) - 1;
     pending_ = true;
@@ -411,6 +414,7 @@ bool Recordset::cancel_update() {
     }
     if (pending_new_) {
         rows_.pop_back();
+        ids_.pop_back();
         view_.pop_back();
         position_ = view_.empty() ? 0 : static_cast<long>(view_.size()) - 1;
     } else if (!bof() && !eof()) {
@@ -422,6 +426,29 @@ bool Recordset::cancel_update() {
     return true;
 }
 
+long Recordset::bookmark() const noexcept {
+    if (state_ != adStateOpen || bof() || eof()) {
+        return 0;
+    }
+    const std::size_t at = view_[static_cast<std::size_t>(position_)];
+    return editable_ ? ids_[at] : static_cast<long>(at) + 1;
+}
+
+bool Recordset::goto_bookmark(const long mark) {
+    if (state_ != adStateOpen || mark <= 0) {
+        return false;
+    }
+    for (std::size_t i = 0; i < view_.size(); ++i) {
+        const std::size_t at = view_[i];
+        if ((editable_ ? ids_[at] : static_cast<long>(at) + 1) == mark) {
+            static_cast<void>(update());
+            position_ = static_cast<long>(i);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool Recordset::delete_current() {
     if (!editable_ || state_ != adStateOpen || bof() || eof()) {
         return false;
@@ -431,6 +458,7 @@ bool Recordset::delete_current() {
     saved_.clear();
     const std::size_t at = view_[static_cast<std::size_t>(position_)];
     rows_.erase(rows_.begin() + static_cast<std::ptrdiff_t>(at));
+    ids_.erase(ids_.begin() + static_cast<std::ptrdiff_t>(at));
     view_.erase(view_.begin() + position_);
     for (auto& index : view_) {
         if (index > at) {

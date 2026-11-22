@@ -118,6 +118,11 @@ public:
     // Find: moves to the first row at or after the current one (plus skip)
     // that meets the criteria; at EOF when there is none.
     bool find(std::string_view criteria, long skip = 0, bool forward = true);
+    // Bookmark: a number naming the current row, stable across sorting,
+    // filtering and deleting other rows; 0 when there is no current row.
+    // goto_bookmark moves there; false when the row is gone or filtered out.
+    [[nodiscard]] long bookmark() const noexcept;
+    bool goto_bookmark(long mark);
 
 private:
     friend class Connection;
@@ -133,6 +138,8 @@ private:
     std::vector<Value> saved_;  // the row as it was before an edit
     std::vector<FieldInfo> fields_;
     std::vector<std::vector<Value>> rows_;
+    std::vector<long> ids_;  // bookmark of each row of an editable set
+    long next_id_{0};
     std::vector<std::size_t> view_;  // indexes into rows_ in cursor order
     std::string filter_;
     std::string sort_;

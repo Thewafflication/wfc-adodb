@@ -181,6 +181,21 @@ int main() {
               "date literal with 24-hour time");
         check(!dates->set_filter("d = #not a date#"), "bad date refused");
     }
+    {
+        mem->move_first();
+        const long first = mem->bookmark();
+        mem->move_last();
+        const long last = mem->bookmark();
+        check(first > 0 && last > 0 && first != last, "bookmarks differ");
+        check(mem->set_sort("id DESC") && mem->goto_bookmark(first) &&
+                  mem->bookmark() == first,
+              "bookmark survives sorting");
+        mem->move_first();
+        static_cast<void>(mem->delete_current());
+        check(mem->goto_bookmark(first) || mem->goto_bookmark(last),
+              "bookmarks survive deletes");
+        check(!mem->goto_bookmark(9999), "unknown bookmark refused");
+    }
     mem->close();
     check(mem->state() == adStateClosed, "closed");
     check(!cn.execute("select 1").recordset->editable(),
