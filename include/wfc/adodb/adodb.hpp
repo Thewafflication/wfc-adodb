@@ -184,7 +184,7 @@ public:
     // among them Provider, are accepted and ignored); a bare string with no
     // "=" is taken as the path; ":memory:" opens a private in-memory
     // database. Under ODBC the SQL is the database's own, BeginTrans does not
-    // nest and last_insert_id is 0. Returns false and fills errors() on
+    // nest and last_insert_id asks the DBMS (@@IDENTITY and its kin). Returns false and fills errors() on
     // failure.
     bool open(std::string_view connection_string);
     void close() noexcept;

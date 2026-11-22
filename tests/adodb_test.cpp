@@ -202,6 +202,13 @@ int main() {
           "a query result is read-only");
 
     {
+        auto id = cn.execute("SELECT @@IDENTITY;");
+        check(id.ok && id.recordset &&
+                  std::get<std::int64_t>(id.recordset->value(0)) ==
+                      cn.last_insert_id(),
+              "select @@identity answers from the last insert");
+    }
+    {
         // Write-back: a one-table SELECT opened updatable.
         cn.execute("create table w(id integer primary key, name text not "
                    "null, n integer default 7)");

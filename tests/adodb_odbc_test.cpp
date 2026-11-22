@@ -100,6 +100,14 @@ int main() {
           "duplicate key is a constraint error");
     cn.clear_errors();
 
+    check(cn.execute("create table auto (id counter primary key, v text(10))")
+              .ok,
+          "create autonumber table");
+    check(cn.execute("insert into auto (v) values ('a')").ok &&
+              cn.execute("insert into auto (v) values ('b')").ok,
+          "insert autonumbers");
+    check(cn.last_insert_id() == 2, "last_insert_id through @@IDENTITY");
+
     check(cn.begin_trans() == 1, "begin");
     check(cn.begin_trans() == 0, "no nesting");
     cn.clear_errors();

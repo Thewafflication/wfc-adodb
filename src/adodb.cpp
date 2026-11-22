@@ -1293,12 +1293,52 @@ std::string Connection::version() const {
 }
 
 std::int64_t Connection::last_insert_id() const noexcept {
-    // ODBC has no portable way to ask; a program reads @@IDENTITY itself.
+    if (impl_->odbc != nullptr) {
+        try {
+            return impl_->odbc->last_insert_id();
+        } catch (...) {
+            return 0;
+        }
+    }
     return impl_->db != nullptr ? sqlite3_last_insert_rowid(impl_->db) : 0;
 }
 
+namespace {
+
+// True for "select @@identity" (any case, optional semicolon): the way ADO
+// programs ask for the key of the row they just inserted.
+[[nodiscard]] bool asks_for_identity(std::string_view sql) {
+    while (!sql.empty() &&
+           (sql.back() == ';' ||
+            std::isspace(static_cast<unsigned char>(sql.back())) != 0)) {
+        sql.remove_suffix(1);
+    }
+    std::size_t i = skip_space(sql, 0);
+    if (!word_at(sql, i, "select")) {
+        return false;
+    }
+    i = skip_space(sql, i + 6);
+    const std::string_view rest = sql.substr(i);
+    constexpr std::string_view wanted = "@@identity";
+    return rest.size() == wanted.size() && same_name(rest, wanted);
+}
+
+}  // namespace
+
 Result Connection::execute(const std::string_view sql,
                            const std::vector<Value>& params) {
+    if (state() == adStateOpen && params.empty() && asks_for_identity(sql)) {
+        auto set = std::make_shared<Recordset>();
+        set->fields_.push_back(FieldInfo{"Expr1000", adInteger, 0});
+        set->rows_.push_back({Value{last_insert_id()}});
+        set->state_ = adStateOpen;
+        set->rebuild_view();
+        Result result;
+        result.ok = true;
+        result.records_affected = -1;
+        result.recordset = std::move(set);
+        return result;
+    }
     return run(sql, params, false);
 }
 

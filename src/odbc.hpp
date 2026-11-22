@@ -48,6 +48,12 @@ public:
     [[nodiscard]] int depth() const noexcept;
 
     [[nodiscard]] std::string version() const;
+    // The DBMS the driver reports (SQL_DBMS_NAME).
+    [[nodiscard]] std::string dbms_name() const;
+    // The identity of the last insert on this session, asked the way the
+    // DBMS does it (@@IDENTITY, LAST_INSERT_ID(), lastval()...); 0 when the
+    // DBMS has no such query or nothing was inserted.
+    [[nodiscard]] std::int64_t last_insert_id();
 
 private:
     struct Impl;

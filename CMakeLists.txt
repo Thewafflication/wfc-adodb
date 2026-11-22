@@ -33,6 +33,10 @@ target_compile_definitions(
   wfc_adodb_sqlite
   PRIVATE SQLITE_THREADSAFE=1 SQLITE_OMIT_LOAD_EXTENSION SQLITE_DQS=0
 )
+if(WFC_WINELIB)
+  # A Winelib program is a Linux program: SQLite uses the POSIX file layer.
+  target_compile_definitions(wfc_adodb_sqlite PRIVATE SQLITE_OS_UNIX=1 SQLITE_OS_WIN=0)
+endif()
 set_target_properties(wfc_adodb_sqlite PROPERTIES OUTPUT_NAME wfcadodb_sqlite)
 if(NOT WIN32)
   find_package(Threads REQUIRED)
@@ -42,8 +46,11 @@ endif()
 add_library(wfc_adodb STATIC src/adodb.cpp src/odbc.cpp)
 target_include_directories(wfc_adodb PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(wfc_adodb PUBLIC wfc_adodb_sqlite)
-if(WIN32)
+if(WIN32 OR WFC_WINELIB)
   target_link_libraries(wfc_adodb PUBLIC odbc32)
+  if(WFC_WINELIB)
+    target_compile_definitions(wfc_adodb PRIVATE WFC_WINELIB=1)
+  endif()
 endif()
 target_compile_features(wfc_adodb PUBLIC cxx_std_20)
 set_target_properties(wfc_adodb PROPERTIES OUTPUT_NAME wfcadodb_static)

@@ -20,7 +20,7 @@ either a query result (read-only) or built in memory.
 | ADODB member | State |
 | --- | --- |
 | `Connection.Open`, `Close`, `State`, `Version` | done (`Data Source=`, `Database=`, `File Name=`, `DBQ=` or a bare path; `:memory:`) |
-| `Connection.Open` through ODBC (`DSN=`, `FILEDSN=`, `Driver={...}` or `Provider=MSDASQL`): MySQL, SQL Server, Postgres, Access, anything with an ODBC driver | done on Windows (odbc32); the SQL is the database's own, `BeginTrans` does not nest, `@@IDENTITY` is the program's to read |
+| `Connection.Open` through ODBC (`DSN=`, `FILEDSN=`, `Driver={...}` or `Provider=MSDASQL`): MySQL, SQL Server, Postgres, Access, anything with an ODBC driver | done on Windows (odbc32) and in Winelib builds (Wine's odbc32 over unixODBC, tested with the SQLite ODBC driver); the SQL is the database's own, `BeginTrans` does not nest; `select @@identity` is answered from the DBMS's own identity query (Access/SQL Server `@@IDENTITY`, MySQL `LAST_INSERT_ID()`, Postgres `lastval()`) |
 | `Connection.Execute` with `?` parameters, `RecordsAffected` | done |
 | `BeginTrans`, `CommitTrans`, `RollbackTrans` (nested, as savepoints) | done |
 | `Connection.Errors` | done (ADO numbers for syntax errors and constraint violations) |

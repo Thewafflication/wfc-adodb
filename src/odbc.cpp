@@ -1,4 +1,4 @@
-// The ODBC backend. See src/odbc.hpp. Windows only for now (odbc32); other
+// The ODBC backend. See src/odbc.hpp. Windows and Winelib (odbc32); other
 // platforms get a backend that reports it is unavailable.
 
 #include "odbc.hpp"
@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <utility>
 
 #ifdef _WIN32
@@ -19,6 +20,15 @@
 
 #include <sql.h>
 #include <sqlext.h>
+#include <sqlucode.h>
+
+#ifdef WFC_WINELIB
+// Wine's odbc32 exports this but its headers do not declare it.
+extern "C" SQLRETURN WINAPI SQLDriverConnectW(
+    SQLHDBC hdbc, SQLHWND hwnd, SQLWCHAR* in, SQLSMALLINT in_length,
+    SQLWCHAR* out, SQLSMALLINT out_max, SQLSMALLINT* out_length,
+    SQLUSMALLINT completion);
+#endif
 #endif
 
 namespace wfc::adodb::detail {
@@ -114,32 +124,34 @@ bool wants_odbc(const std::string_view connection_string) {
 
 namespace {
 
-[[nodiscard]] std::wstring widen(const std::string_view text) {
+[[nodiscard]] std::u16string widen(const std::string_view text) {
     if (text.empty()) {
         return {};
     }
     const int size = MultiByteToWideChar(
         CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
-    std::wstring out(static_cast<std::size_t>(size), L'\0');
+    std::u16string out(static_cast<std::size_t>(size), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
-                        out.data(), size);
+                        reinterpret_cast<WCHAR*>(out.data()), size);
     return out;
 }
 
-[[nodiscard]] std::string narrow(const wchar_t* text, const std::size_t count) {
+[[nodiscard]] std::string narrow(const char16_t* text, const std::size_t count) {
     if (count == 0) {
         return {};
     }
     const int size =
-        WideCharToMultiByte(CP_UTF8, 0, text, static_cast<int>(count), nullptr,
+        WideCharToMultiByte(CP_UTF8, 0, reinterpret_cast<const WCHAR*>(text),
+                            static_cast<int>(count), nullptr,
                             0, nullptr, nullptr);
     std::string out(static_cast<std::size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text, static_cast<int>(count), out.data(),
+    WideCharToMultiByte(CP_UTF8, 0, reinterpret_cast<const WCHAR*>(text),
+                        static_cast<int>(count), out.data(),
                         size, nullptr, nullptr);
     return out;
 }
 
-[[nodiscard]] SQLWCHAR* sql_text(std::wstring& text) {
+[[nodiscard]] SQLWCHAR* sql_text(std::u16string& text) {
     return reinterpret_cast<SQLWCHAR*>(text.data());
 }
 
@@ -235,10 +247,10 @@ void collect(const SQLSMALLINT kind, const SQLHANDLE handle,
             break;
         }
         Error error;
-        error.sql_state = narrow(reinterpret_cast<const wchar_t*>(state), 5U);
+        error.sql_state = narrow(reinterpret_cast<const char16_t*>(state), 5U);
         error.number = number_for(error.sql_state);
         error.description = narrow(
-            reinterpret_cast<const wchar_t*>(message),
+            reinterpret_cast<const char16_t*>(message),
             static_cast<std::size_t>(std::min<SQLSMALLINT>(length, 1023)));
         error.source = "ODBC";
         errors.push_back(std::move(error));
@@ -282,7 +294,7 @@ enum class Fetch { Value, Null, Failed };
         }
     }
     if (ctype == SQL_C_WCHAR) {
-        out = narrow(reinterpret_cast<const wchar_t*>(raw.data()),
+        out = narrow(reinterpret_cast<const char16_t*>(raw.data()),
                      raw.size() / 2U);
     } else {
         out = std::move(raw);
@@ -389,7 +401,7 @@ enum class Fetch { Value, Null, Failed };
 struct Parameter {
     std::int64_t integer{0};
     double real{0};
-    std::wstring text;
+    std::u16string text;
     Blob bytes;
     SQLLEN indicator{0};
 };
@@ -488,7 +500,7 @@ bool OdbcSession::connect(const std::string_view connection_string,
         return false;
     }
     SQLSetConnectAttr(impl_->dbc, SQL_LOGIN_TIMEOUT, as_pointer(15), 0);
-    std::wstring in = widen(text);
+    std::u16string in = widen(text);
     SQLWCHAR out[1024] = {};
     SQLSMALLINT out_length = 0;
     const SQLRETURN status =
@@ -538,7 +550,7 @@ bool OdbcSession::execute(const std::string_view sql,
         return false;
     };
 
-    std::wstring text = widen(sql);
+    std::u16string text = widen(sql);
     std::vector<Parameter> store(params.size());
     SQLRETURN status = SQL_SUCCESS;
     if (params.empty()) {
@@ -591,7 +603,7 @@ bool OdbcSession::execute(const std::string_view sql,
         const Column column = classify(type);
         kinds.push_back(column.kind);
         out.fields.push_back(
-            FieldInfo{narrow(reinterpret_cast<const wchar_t*>(name),
+            FieldInfo{narrow(reinterpret_cast<const char16_t*>(name),
                              static_cast<std::size_t>(
                                  std::min<SQLSMALLINT>(name_length, 255))),
                       column.ado, static_cast<long>(size)});
@@ -651,6 +663,64 @@ bool OdbcSession::end(const bool commit, std::vector<Error>& errors) {
     return done;
 }
 
+std::int64_t OdbcSession::last_insert_id() {
+    if (!impl_->open) {
+        return 0;
+    }
+    // Each DBMS has its own way to ask; the identity belongs to this session.
+    const std::string name = lowered(dbms_name());
+    const auto has = [&](const char* word) {
+        return name.find(word) != std::string::npos;
+    };
+    const char* sql = nullptr;
+    if (has("access") || has("sql server") || has("sybase") ||
+        has("adaptive server")) {
+        sql = "SELECT @@IDENTITY";
+    } else if (has("mysql") || has("mariadb")) {
+        sql = "SELECT LAST_INSERT_ID()";
+    } else if (has("postgres")) {
+        sql = "SELECT lastval()";
+    } else if (has("sqlite")) {
+        sql = "SELECT last_insert_rowid()";
+    } else if (has("db2")) {
+        sql = "VALUES IDENTITY_VAL_LOCAL()";
+    }
+    if (sql == nullptr) {
+        return 0;
+    }
+    OdbcTable table;
+    std::vector<Error> ignored;
+    if (!execute(sql, {}, table, ignored) || table.rows.empty() ||
+        table.rows.front().empty()) {
+        return 0;
+    }
+    const Value& value = table.rows.front().front();
+    if (const auto* whole = std::get_if<std::int64_t>(&value)) {
+        return *whole;
+    }
+    if (const auto* real = std::get_if<double>(&value)) {
+        return static_cast<std::int64_t>(*real);
+    }
+    if (const auto* text = std::get_if<std::string>(&value)) {
+        return std::strtoll(text->c_str(), nullptr, 10);
+    }
+    return 0;
+}
+
+std::string OdbcSession::dbms_name() const {
+    if (!impl_->open) {
+        return {};
+    }
+    SQLWCHAR buffer[256] = {};
+    SQLSMALLINT length = 0;
+    if (!SQL_SUCCEEDED(SQLGetInfoW(impl_->dbc, SQL_DBMS_NAME, buffer,
+                                   sizeof(buffer), &length))) {
+        return {};
+    }
+    return narrow(reinterpret_cast<const char16_t*>(buffer),
+                  static_cast<std::size_t>(length) / 2U);
+}
+
 std::string OdbcSession::version() const {
     if (!impl_->open) {
         return {};
@@ -662,7 +732,7 @@ std::string OdbcSession::version() const {
                                        &length))) {
             return std::string{};
         }
-        return narrow(reinterpret_cast<const wchar_t*>(buffer),
+        return narrow(reinterpret_cast<const char16_t*>(buffer),
                       static_cast<std::size_t>(length) / 2U);
     };
     return info(SQL_DBMS_NAME) + " " + info(SQL_DBMS_VER);
@@ -685,7 +755,7 @@ int OdbcSession::depth() const noexcept {
 
 bool OdbcSession::connect(std::string_view, std::vector<Error>& errors) {
     errors.push_back(Error{kUnspecified,
-                           "The ODBC backend is only built on Windows.",
+                           "The ODBC backend is only built on Windows and Winelib.",
                            "ODBC",
                            {}});
     return false;
@@ -707,6 +777,14 @@ bool OdbcSession::end(bool, std::vector<Error>&) {
 }
 
 std::string OdbcSession::version() const {
+    return {};
+}
+
+std::int64_t OdbcSession::last_insert_id() {
+    return 0;
+}
+
+std::string OdbcSession::dbms_name() const {
     return {};
 }
 
