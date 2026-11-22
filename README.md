@@ -9,7 +9,7 @@ SQLite 3.54.1 is vendored as the public-domain amalgamation in
 `third_party/sqlite` (SHA3-256 of the source archive, as published on
 sqlite.org: `92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30`).
 
-## Status (0.2.0)
+## Status (0.3.0)
 
 The C++ core is complete for its scope and tested. WFC binds it
 (src/interpreter/ado_helper.cpp and the VB classes in
@@ -30,7 +30,32 @@ SQLite-backed classes in the interpreter and in compiled programs.
 | Disconnected `Recordset` (`Fields.Append`, `Open` with no source, `AddNew`, `Update`, `CancelUpdate`, `Delete`) | done |
 | Updating a query result: `rs.Open "select ... from t", cn, , adLockOptimistic` (a bare table name works too) writes `Update`, `AddNew` and `Delete` to the table at once | done for a SELECT of plain columns from one table (WHERE, ORDER BY, LIMIT allowed); joins, expressions, grouping and views stay read-only; `cn.Execute` results stay read-only, as in ADO; SQLite only |
 | `CreateObject("ADODB.*")` binding in the interpreter and in native programs | done |
+| `msado15.dll`, a COM server (see below) | done: Connection, Recordset, Command, Fields, Field, Parameters, Parameter, late-bound |
 | Batch updates (`UpdateBatch`), `Clone`, `Save`/`Load`, shaped recordsets, server cursors | not planned |
+
+## The COM server (`msado15.dll`)
+
+With `-DWFC_ADODB_SHARED=ON` the library is also built as `msado15.dll`, a COM
+server that answers `ADODB.Connection`, `ADODB.Recordset` and `ADODB.Command`
+from the library, so any COM client (a Visual Basic 6 program, VBScript, a
+script host) gets the SQLite-backed ADODB. `regsvr32 msado15.dll` registers it
+under WFC's own ProgIDs (`WFC.ADODB.Connection` and so on) and class ids;
+with `WFC_REGISTER_MICROSOFT_IDS=1` it also serves the Microsoft ProgIDs
+(`ADODB.Connection`) and what was registered there before comes back with the
+unregistration. `WFC_REGISTER_SCOPE=user|machine` picks the registry.
+
+The objects are late-bound (`IDispatch`): `CreateObject("WFC.ADODB.Connection")`
+and `Dim cn As Object` work; there is no type library, so early binding
+(`As ADODB.Connection`) and the `Errors` collection are not offered. The
+members are the ones of the table above.
+
+```vbscript
+Set cn = CreateObject("WFC.ADODB.Connection")
+cn.Open "Data Source=:memory:"
+cn.Execute "create table t(id integer primary key, name text)"
+Set rs = CreateObject("WFC.ADODB.Recordset")
+rs.Open "select * from t", cn
+```
 
 ## Build and test
 

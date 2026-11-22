@@ -1,0 +1,6 @@
+LIBRARY msado15.dll
+EXPORTS
+    DllRegisterServer PRIVATE
+    DllUnregisterServer PRIVATE
+    DllCanUnloadNow PRIVATE
+    DllGetClassObject PRIVATE
