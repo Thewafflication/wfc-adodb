@@ -157,6 +157,30 @@ int main() {
           "unknown sort field refused");
     check(mem->set_sort("") && std::get<std::int64_t>(mem->value(0)) == 2,
           "sort removed");
+    {
+        auto dates = Recordset::create();
+        dates->append_field("d", 7, 0);
+        dates->open_empty();
+        // 2020-01-01 is OLE day 43831; 2020-06-15 is 43997; with 18:00, .75.
+        for (const double serial : {43831.0, 43997.0, 43997.75}) {
+            dates->add_new();
+            dates->set_value(0, Value{serial});
+            dates->update();
+        }
+        check(dates->set_filter("d > #2020-01-01#") &&
+                  dates->record_count() == 2,
+              "date literal, ISO form");
+        check(dates->set_filter("d >= #6/15/2020#") &&
+                  dates->record_count() == 2,
+              "date literal, US form");
+        check(dates->set_filter("d = #6/15/2020 6:00 PM#") &&
+                  dates->record_count() == 1,
+              "date literal with a time");
+        check(dates->set_filter("d < #2020-06-15 12:00#") &&
+                  dates->record_count() == 2,
+              "date literal with 24-hour time");
+        check(!dates->set_filter("d = #not a date#"), "bad date refused");
+    }
     mem->close();
     check(mem->state() == adStateClosed, "closed");
     check(!cn.execute("select 1").recordset->editable(),

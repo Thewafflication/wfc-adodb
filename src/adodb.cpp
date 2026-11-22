@@ -169,6 +169,76 @@ namespace {
     return parts;
 }
 
+// Days from 1899-12-30 (the OLE automation origin) to a civil date.
+[[nodiscard]] double ole_days(const long year, const long month,
+                              const long day) {
+    const long y = month <= 2 ? year - 1 : year;
+    const long era = (y >= 0 ? y : y - 399) / 400;
+    const long yoe = y - era * 400;
+    const long mp = (month + 9) % 12;
+    const long doy = (153 * mp + 2) / 5 + day - 1;
+    const long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return static_cast<double>(era * 146097 + doe - 719468 + 25569);
+}
+
+// The text of a #date# literal (M/D/YYYY or YYYY-MM-DD, then an optional time
+// H:MM[:SS] [AM|PM]) as an OLE date; false when it is not one.
+[[nodiscard]] bool parse_date_literal(std::string_view text, double& out) {
+    text = trim(text);
+    const auto gap = text.find_first_of(" T");
+    const std::string d(text.substr(0, gap));
+    const std::string t(gap == std::string_view::npos
+                            ? std::string_view{}
+                            : trim(text.substr(gap + 1)));
+    long a = 0;
+    long b = 0;
+    long c = 0;
+    char s1 = 0;
+    char s2 = 0;
+    if (std::sscanf(d.c_str(), "%ld%c%ld%c%ld", &a, &s1, &b, &s2, &c) != 5 ||
+        s1 != s2 || (s1 != '/' && s1 != '-')) {
+        return false;
+    }
+    long year = c;
+    long month = a;
+    long day = b;
+    if (s1 == '-' && a > 31) {
+        year = a;
+        month = b;
+        day = c;
+    }
+    if (month < 1 || month > 12 || day < 1 || day > 31) {
+        return false;
+    }
+    double fraction = 0;
+    if (!t.empty()) {
+        long h = 0;
+        long m = 0;
+        long sec = 0;
+        char tail[8] = {};
+        const int got =
+            std::sscanf(t.c_str(), "%ld:%ld:%ld %7s", &h, &m, &sec, tail);
+        if (got < 3) {
+            sec = 0;
+            tail[0] = 0;
+            if (std::sscanf(t.c_str(), "%ld:%ld %7s", &h, &m, tail) < 2) {
+                return false;
+            }
+        }
+        const std::string ampm = lower(tail);
+        if (ampm == "pm" && h < 12) {
+            h += 12;
+        } else if (ampm == "am" && h == 12) {
+            h = 0;
+        }
+        fraction = (static_cast<double>(h) * 3600.0 +
+                    static_cast<double>(m) * 60.0 + static_cast<double>(sec)) /
+                   86400.0;
+    }
+    out = ole_days(year, month, day) + fraction;
+    return true;
+}
+
 [[nodiscard]] bool is_operator_char(const char c) {
     return c == '=' || c == '<' || c == '>';
 }
@@ -384,6 +454,19 @@ bool Recordset::matches(const std::vector<Value>& row,
                 valid = false;
                 return false;
             }
+            std::string date_text;
+            if (literal.size() >= 3 && literal.front() == '#' &&
+                literal.back() == '#') {
+                date_text = literal.substr(1, literal.size() - 2);
+                double serial = 0;
+                if (!parse_date_literal(date_text, serial)) {
+                    valid = false;
+                    return false;
+                }
+                char buffer[40];
+                std::snprintf(buffer, sizeof(buffer), "%.15g", serial);
+                literal = buffer;
+            }
             const bool quoted = literal.size() >= 2 &&
                                 literal.front() == '\'' &&
                                 literal.back() == '\'';
@@ -422,7 +505,8 @@ bool Recordset::matches(const std::vector<Value>& row,
                                           left);
                             shown = buffer;
                         }
-                        const int c = lower(shown).compare(lower(literal));
+                        const int c = lower(shown).compare(
+                            lower(date_text.empty() ? literal : date_text));
                         order = c < 0 ? -1 : (c > 0 ? 1 : 0);
                     }
                     if (op == "=") {
