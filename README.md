@@ -25,7 +25,7 @@ either a query result (read-only) or built in memory.
 | `BeginTrans`, `CommitTrans`, `RollbackTrans` (nested, as savepoints) | done |
 | `Connection.Errors` | done (ADO numbers for syntax errors and constraint violations) |
 | `Recordset` read-only static cursor: `Fields`, `MoveFirst/Last/Next/Previous`, `BOF`, `EOF`, `RecordCount`, `AbsolutePosition` | done |
-| Disconnected `Recordset` (`Fields.Append`, `AddNew`, `Update`, `CancelUpdate`, `Delete`, `Filter`, `Find`, `GetRows`) | done; `Sort` and writing a query result back to its table are planned |
+| Disconnected `Recordset` (`Fields.Append`, `AddNew`, `Update`, `CancelUpdate`, `Delete`, `Filter`, `Find`, `GetRows`, `Sort`) | done; writing a query result back to its table is planned |
 | `Command` object, `Parameters`, named parameters | planned |
 | `CreateObject("ADODB.*")` binding in the interpreter and in native programs | done for Connection, Command (`Execute , Array(...)`), read-only Recordset |
 | ADO type mapping beyond Integer, BigInt, Double, VarWChar, LongVarBinary; Date and Boolean | planned |

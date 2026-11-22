@@ -145,6 +145,18 @@ int main() {
     mem->set_value(0, Value{std::int64_t{9}});
     check(mem->cancel_update() && mem->record_count() == 3,
           "cancel_update drops the new row");
+    check(
+        mem->set_sort("id DESC") && std::get<std::int64_t>(mem->value(0)) == 4,
+        "sort descending starts at the largest");
+    mem->move_last();
+    check(std::get<std::int64_t>(mem->value(0)) == 2, "sort descending ends");
+    check(mem->set_sort("[name] asc, id") &&
+              std::get<std::int64_t>(mem->value(0)) == 2,
+          "sort by name ascending");
+    check(!mem->set_sort("nosuch") && mem->sort() == "[name] asc, id",
+          "unknown sort field refused");
+    check(mem->set_sort("") && std::get<std::int64_t>(mem->value(0)) == 2,
+          "sort removed");
     mem->close();
     check(mem->state() == adStateClosed, "closed");
     check(!cn.execute("select 1").recordset->editable(),

@@ -111,6 +111,10 @@ public:
     // removes the filter. False when the text is not understood.
     bool set_filter(std::string_view criteria);
     [[nodiscard]] const std::string& filter() const noexcept { return filter_; }
+    // Sort: "field [ASC|DESC], field ..."; an empty text restores the original
+    // order. False when a field is unknown. The cursor goes to the first row.
+    bool set_sort(std::string_view spec);
+    [[nodiscard]] const std::string& sort() const noexcept { return sort_; }
     // Find: moves to the first row at or after the current one (plus skip)
     // that meets the criteria; at EOF when there is none.
     bool find(std::string_view criteria, long skip = 0, bool forward = true);
@@ -131,6 +135,7 @@ private:
     std::vector<std::vector<Value>> rows_;
     std::vector<std::size_t> view_;  // indexes into rows_ in cursor order
     std::string filter_;
+    std::string sort_;
     long position_{0};
 };
 

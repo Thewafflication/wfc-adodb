@@ -258,6 +258,7 @@ void Recordset::close() noexcept {
     rows_.clear();
     view_.clear();
     filter_.clear();
+    sort_.clear();
     position_ = 0;
 }
 
@@ -448,6 +449,69 @@ bool Recordset::matches(const std::vector<Value>& row,
     return false;
 }
 
+namespace {
+
+struct SortKey {
+    std::size_t field{0};
+    bool descending{false};
+};
+
+// -1, 0 or 1; Null sorts first, numbers by value, text without regard to case.
+[[nodiscard]] int compare_values(const Value& a, const Value& b) {
+    double x = 0;
+    double y = 0;
+    if (numeric_of(a, x) && numeric_of(b, y)) {
+        return x < y ? -1 : (x > y ? 1 : 0);
+    }
+    if (const auto* s = std::get_if<std::string>(&a)) {
+        if (const auto* t = std::get_if<std::string>(&b)) {
+            const std::string l = lower(*s);
+            const std::string r = lower(*t);
+            return l < r ? -1 : (l > r ? 1 : 0);
+        }
+    }
+    if (a.index() != b.index()) {
+        return a.index() < b.index() ? -1 : 1;
+    }
+    if (const auto* p = std::get_if<Blob>(&a)) {
+        const auto& q = std::get<Blob>(b);
+        return *p < q ? -1 : (*p > q ? 1 : 0);
+    }
+    return 0;
+}
+
+// The sort spec as keys; false when a field is unknown.
+[[nodiscard]] bool parse_sort(const Recordset& set, const std::string_view spec,
+                              std::vector<SortKey>& keys) {
+    std::string_view rest = spec;
+    while (!trim(rest).empty()) {
+        const auto cut = rest.find(',');
+        std::string_view part = trim(rest.substr(0, cut));
+        rest = cut == std::string_view::npos ? std::string_view{}
+                                             : rest.substr(cut + 1);
+        SortKey key;
+        const std::string tail = lower(part);
+        if (tail.size() > 5 && tail.ends_with(" desc")) {
+            key.descending = true;
+            part = trim(part.substr(0, part.size() - 5));
+        } else if (tail.size() > 4 && tail.ends_with(" asc")) {
+            part = trim(part.substr(0, part.size() - 4));
+        }
+        if (part.size() > 1 && part.front() == '[' && part.back() == ']') {
+            part = part.substr(1, part.size() - 2);
+        }
+        const int index = set.field_index(part);
+        if (index < 0) {
+            return false;
+        }
+        key.field = static_cast<std::size_t>(index);
+        keys.push_back(key);
+    }
+    return true;
+}
+
+}  // namespace
+
 void Recordset::rebuild_view() {
     view_.clear();
     bool valid = true;
@@ -456,7 +520,36 @@ void Recordset::rebuild_view() {
             view_.push_back(i);
         }
     }
+    std::vector<SortKey> keys;
+    if (!sort_.empty() && parse_sort(*this, sort_, keys)) {
+        std::stable_sort(view_.begin(), view_.end(),
+                         [&](const std::size_t a, const std::size_t b) {
+                             for (const auto& key : keys) {
+                                 const int c = compare_values(
+                                     rows_[a][key.field], rows_[b][key.field]);
+                                 if (c != 0) {
+                                     return key.descending ? c > 0 : c < 0;
+                                 }
+                             }
+                             return false;
+                         });
+    }
     position_ = 0;
+}
+
+bool Recordset::set_sort(const std::string_view spec) {
+    if (state_ != adStateOpen) {
+        return false;
+    }
+    static_cast<void>(update());
+    std::vector<SortKey> keys;
+    const std::string text(trim(spec));
+    if (!parse_sort(*this, text, keys)) {
+        return false;
+    }
+    sort_ = text;
+    rebuild_view();
+    return true;
 }
 
 bool Recordset::set_filter(const std::string_view criteria) {
