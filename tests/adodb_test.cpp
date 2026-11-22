@@ -201,6 +201,45 @@ int main() {
     check(!cn.execute("select 1").recordset->editable(),
           "a query result is read-only");
 
+    {
+        // Write-back: a one-table SELECT opened updatable.
+        cn.execute("create table w(id integer primary key, name text not "
+                   "null, n integer default 7)");
+        cn.execute("insert into w(name) values ('a'), ('b')");
+        auto up = cn.execute_updatable("select id, name from w order by id");
+        check(up.ok && up.recordset && up.recordset->editable() &&
+                  up.recordset->linked(),
+              "a simple select is linked");
+        auto& w = *up.recordset;
+        check(w.set_value(1, Value{std::string("A")}) && w.update(),
+              "update writes");
+        w.add_new();
+        w.set_value(1, Value{std::string("c")});
+        check(w.update() && std::get<std::int64_t>(w.value(0)) == 3,
+              "insert reads the key back");
+        w.move_first();
+        check(w.delete_current(), "delete writes");
+        auto seen = cn.execute("select id, name, n from w order by id");
+        check(seen.recordset->record_count() == 2 &&
+                  std::get<std::string>(seen.recordset->value(1)) == "b",
+              "the table has the changes");
+        seen.recordset->move_last();
+        check(std::get<std::int64_t>(seen.recordset->value(2)) == 7,
+              "the default was applied");
+        w.add_new();
+        Error failure;
+        check(!w.update() && w.take_error(failure) && failure.number != 0,
+              "a failing insert reports an error and is undone");
+        check(!cn.execute_updatable("select upper(name) from w")
+                   .recordset->editable(),
+              "an expression is read-only");
+        check(!cn.execute_updatable("select * from w a, w b")
+                   .recordset->editable(),
+              "a join is read-only");
+        check(cn.execute_updatable("select * from w where id > 1 limit 5")
+                  .recordset->linked(),
+              "where and limit stay linked");
+    }
     cn.close();
     check(cn.state() == adStateClosed, "closed again");
 

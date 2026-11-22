@@ -17,6 +17,10 @@
 
 namespace wfc::adodb {
 
+namespace detail {
+struct SqliteLink;
+}
+
 // A field value. monostate is Null.
 using Blob = std::vector<unsigned char>;
 using Value =
@@ -52,7 +56,8 @@ struct FieldInfo {
 // A client-side static cursor: the whole result is read when it is opened, as
 // ADO does for adUseClient. Positions are 0-based internally; AbsolutePosition
 // is 1-based as in ADO. A recordset that comes from Connection::execute is
-// read-only. One made with Recordset::create (fields appended, then
+// read-only unless Connection::execute_updatable linked it to its table. One
+// made with Recordset::create (fields appended, then
 // open_empty) is disconnected and editable: add_new, set_value, update,
 // cancel_update, delete_current.
 class Recordset {
@@ -107,6 +112,13 @@ public:
     bool cancel_update();
     bool delete_current();
 
+    // A recordset made by Connection::execute_updatable writes each Update and
+    // Delete to its table at once (ADO's immediate mode). When such a write
+    // fails the change is undone and the error is kept here; taking it clears
+    // it.
+    [[nodiscard]] bool linked() const noexcept { return link_ != nullptr; }
+    [[nodiscard]] bool take_error(Error& out);
+
     // Filter criteria: field op literal, joined by AND / OR; an empty text
     // removes the filter. False when the text is not understood.
     bool set_filter(std::string_view criteria);
@@ -130,6 +142,7 @@ private:
     [[nodiscard]] bool matches(const std::vector<Value>& row,
                                std::string_view criteria, bool& valid) const;
     void rebuild_view();
+    bool flush_row(std::size_t at);
 
     int state_{adStateClosed};
     bool editable_{false};
@@ -140,6 +153,10 @@ private:
     std::vector<std::vector<Value>> rows_;
     std::vector<long> ids_;  // bookmark of each row of an editable set
     long next_id_{0};
+    std::shared_ptr<detail::SqliteLink> link_;
+    std::vector<std::int64_t> keys_;  // rowid of each row of an editable set
+    bool has_error_{false};
+    Error error_;
     std::vector<std::size_t> view_;  // indexes into rows_ in cursor order
     std::string filter_;
     std::string sort_;
@@ -175,6 +192,12 @@ public:
 
     // Execute one statement with positional parameters (? placeholders).
     Result execute(std::string_view sql, const std::vector<Value>& params = {});
+    // As execute, but a SELECT of one table's columns (no join, group, union
+    // or expression) comes back editable and linked to that table, as
+    // Recordset.Open does with a lock type above read-only. Other statements
+    // behave as in execute.
+    Result execute_updatable(std::string_view sql,
+                             const std::vector<Value>& params = {});
 
     // Transactions; BeginTrans returns the nesting level, 0 on failure.
     int begin_trans();
@@ -194,6 +217,8 @@ private:
     std::unique_ptr<Impl> impl_;
     std::vector<Error> errors_;
     void fail(long number, std::string description);
+    Result run(std::string_view sql, const std::vector<Value>& params,
+               bool keyed);
 };
 
 // The path of a connection string, or empty when it names none.

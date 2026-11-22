@@ -13,6 +13,126 @@
 #include "sqlite3.h"
 
 namespace wfc::adodb {
+
+namespace detail {
+
+// The SQLite handle a connection shares with the recordsets linked to it; it
+// is cleared when the connection closes.
+struct SqliteHandle {
+    sqlite3* db{nullptr};
+};
+
+// Where an updatable recordset writes: the table as the query named it, and
+// the table column behind each field.
+struct SqliteLink {
+    std::shared_ptr<SqliteHandle> handle;
+    std::string table;
+    std::vector<std::string> columns;
+};
+
+}  // namespace detail
+
+namespace {
+
+void bind_all(sqlite3_stmt* stmt, const std::vector<Value>& params) {
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        const Value& v = params[i];
+        const int slot = static_cast<int>(i) + 1;
+        switch (v.index()) {
+            case 1:
+                sqlite3_bind_int64(stmt, slot, std::get<1>(v));
+                break;
+            case 2:
+                sqlite3_bind_double(stmt, slot, std::get<2>(v));
+                break;
+            case 3: {
+                const auto& text = std::get<3>(v);
+                sqlite3_bind_text(stmt, slot, text.data(),
+                                  static_cast<int>(text.size()),
+                                  SQLITE_TRANSIENT);
+                break;
+            }
+            case 4: {
+                const auto& blob = std::get<4>(v);
+                sqlite3_bind_blob(stmt, slot, blob.data(),
+                                  static_cast<int>(blob.size()),
+                                  SQLITE_TRANSIENT);
+                break;
+            }
+            default:
+                sqlite3_bind_null(stmt, slot);
+        }
+    }
+}
+
+[[nodiscard]] Value column_value(sqlite3_stmt* stmt, const int c) {
+    switch (sqlite3_column_type(stmt, c)) {
+        case SQLITE_INTEGER:
+            return static_cast<std::int64_t>(sqlite3_column_int64(stmt, c));
+        case SQLITE_FLOAT:
+            return sqlite3_column_double(stmt, c);
+        case SQLITE_TEXT:
+            return std::string(
+                reinterpret_cast<const char*>(sqlite3_column_text(stmt, c)),
+                static_cast<std::size_t>(sqlite3_column_bytes(stmt, c)));
+        case SQLITE_BLOB: {
+            const auto* bytes =
+                static_cast<const unsigned char*>(sqlite3_column_blob(stmt, c));
+            const auto size =
+                static_cast<std::size_t>(sqlite3_column_bytes(stmt, c));
+            return Blob(bytes, bytes + size);
+        }
+        default:
+            return std::monostate{};
+    }
+}
+
+[[nodiscard]] std::string quoted_name(const std::string_view name) {
+    std::string out = "\"";
+    for (const char c : name) {
+        if (c == '"') {
+            out += '"';
+        }
+        out += c;
+    }
+    out += '"';
+    return out;
+}
+
+// Runs one write against the linked table; false with error filled when it
+// fails. changed is the number of rows it touched.
+[[nodiscard]] bool run_write(const detail::SqliteLink& link,
+                             const std::string& sql,
+                             const std::vector<Value>& params,
+                             std::int64_t& inserted, int& changed,
+                             Error& error) {
+    sqlite3* db = link.handle->db;
+    if (db == nullptr) {
+        error = Error{3704, "Operation is not allowed when the object is closed.",
+                      "wfc-adodb", {}};
+        return false;
+    }
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        error = Error{-2147217900L, sqlite3_errmsg(db), "wfc-adodb", {}};
+        return false;
+    }
+    bind_all(stmt, params);
+    const int status = sqlite3_step(stmt);
+    const std::string message = sqlite3_errmsg(db);
+    sqlite3_finalize(stmt);
+    if (status != SQLITE_DONE) {
+        error = Error{status == SQLITE_CONSTRAINT ? -2147217873L : -2147467259L,
+                      message, "wfc-adodb", {}};
+        return false;
+    }
+    inserted = sqlite3_last_insert_rowid(db);
+    changed = sqlite3_changes(db);
+    return true;
+}
+
+}  // namespace
+
 namespace {
 
 constexpr long kSyntaxError = -2147217900L;  // 0x80040E14, DB_E_ERRORSINCOMMAND
@@ -295,6 +415,7 @@ bool Recordset::open_empty() {
     state_ = adStateOpen;
     rows_.clear();
     ids_.clear();
+    keys_.clear();
     view_.clear();
     position_ = 0;
     return true;
@@ -355,6 +476,9 @@ void Recordset::close() noexcept {
     fields_.clear();
     rows_.clear();
     ids_.clear();
+    keys_.clear();
+    link_.reset();
+    has_error_ = false;
     view_.clear();
     filter_.clear();
     sort_.clear();
@@ -376,6 +500,7 @@ bool Recordset::add_new() {
     static_cast<void>(update());
     rows_.emplace_back(fields_.size());
     ids_.push_back(++next_id_);
+    keys_.push_back(0);
     view_.push_back(rows_.size() - 1);
     position_ = static_cast<long>(view_.size()) - 1;
     pending_ = true;
@@ -398,9 +523,111 @@ bool Recordset::set_value(const std::size_t index, Value value) {
     return true;
 }
 
+bool Recordset::take_error(Error& out) {
+    if (!has_error_) {
+        return false;
+    }
+    out = error_;
+    has_error_ = false;
+    return true;
+}
+
+// Writes the pending row to the linked table; a row of a disconnected
+// recordset has nowhere to go and always succeeds.
+bool Recordset::flush_row(const std::size_t at) {
+    if (link_ == nullptr) {
+        return true;
+    }
+    const auto& row = rows_[at];
+    const auto& table = link_->table;
+    std::string sql;
+    std::vector<Value> params;
+    if (pending_new_) {
+        std::string names;
+        std::string marks;
+        for (std::size_t i = 0; i < row.size(); ++i) {
+            if (row[i].index() == 0) {
+                continue;
+            }
+            names += names.empty() ? "" : ", ";
+            marks += marks.empty() ? "?" : ", ?";
+            names += quoted_name(link_->columns[i]);
+            params.push_back(row[i]);
+        }
+        sql = names.empty() ? "INSERT INTO " + table + " DEFAULT VALUES"
+                            : "INSERT INTO " + table + " (" + names +
+                                  ") VALUES (" + marks + ")";
+    } else {
+        std::string sets;
+        for (std::size_t i = 0; i < row.size(); ++i) {
+            if (i < saved_.size() && row[i] == saved_[i]) {
+                continue;
+            }
+            sets += sets.empty() ? "" : ", ";
+            sets += quoted_name(link_->columns[i]) + " = ?";
+            params.push_back(row[i]);
+        }
+        if (sets.empty()) {
+            return true;
+        }
+        sql = "UPDATE " + table + " SET " + sets + " WHERE _rowid_ = ?";
+        params.emplace_back(keys_[at]);
+    }
+    std::int64_t inserted = 0;
+    int changed = 0;
+    Error error;
+    if (!run_write(*link_, sql, params, inserted, changed, error)) {
+        error_ = std::move(error);
+        has_error_ = true;
+        return false;
+    }
+    if (!pending_new_) {
+        if (changed == 0) {
+            error_ = Error{-2147217864L,
+                           "Row cannot be located for updating. Some values "
+                           "may have been changed since it was last read.",
+                           "wfc-adodb", {}};
+            has_error_ = true;
+            return false;
+        }
+        return true;
+    }
+    keys_[at] = inserted;
+    // Read the row back: the table fills in keys and defaults.
+    std::string names;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        names += names.empty() ? "" : ", ";
+        names += quoted_name(link_->columns[i]);
+    }
+    sqlite3* db = link_->handle->db;
+    sqlite3_stmt* stmt = nullptr;
+    const std::string select =
+        "SELECT " + names + " FROM " + table + " WHERE _rowid_ = ?";
+    if (sqlite3_prepare_v2(db, select.c_str(), -1, &stmt, nullptr) ==
+        SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, inserted);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            for (std::size_t i = 0; i < rows_[at].size(); ++i) {
+                rows_[at][i] = column_value(stmt, static_cast<int>(i));
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+    return true;
+}
+
 bool Recordset::update() {
     if (!pending_) {
         return false;
+    }
+    if (link_ != nullptr) {
+        const std::size_t at =
+            pending_new_ ? rows_.size() - 1
+                         : view_[static_cast<std::size_t>(position_)];
+        if (!flush_row(at)) {
+            static_cast<void>(cancel_update());
+            return false;
+        }
     }
     pending_ = false;
     pending_new_ = false;
@@ -415,6 +642,7 @@ bool Recordset::cancel_update() {
     if (pending_new_) {
         rows_.pop_back();
         ids_.pop_back();
+        keys_.pop_back();
         view_.pop_back();
         position_ = view_.empty() ? 0 : static_cast<long>(view_.size()) - 1;
     } else if (!bof() && !eof()) {
@@ -457,8 +685,21 @@ bool Recordset::delete_current() {
     pending_new_ = false;
     saved_.clear();
     const std::size_t at = view_[static_cast<std::size_t>(position_)];
+    if (link_ != nullptr && keys_[at] != 0) {
+        std::int64_t inserted = 0;
+        int changed = 0;
+        Error error;
+        if (!run_write(*link_,
+                       "DELETE FROM " + link_->table + " WHERE _rowid_ = ?",
+                       {Value{keys_[at]}}, inserted, changed, error)) {
+            error_ = std::move(error);
+            has_error_ = true;
+            return false;
+        }
+    }
     rows_.erase(rows_.begin() + static_cast<std::ptrdiff_t>(at));
     ids_.erase(ids_.begin() + static_cast<std::ptrdiff_t>(at));
+    keys_.erase(keys_.begin() + static_cast<std::ptrdiff_t>(at));
     view_.erase(view_.begin() + position_);
     for (auto& index : view_) {
         if (index > at) {
@@ -744,7 +985,238 @@ struct Connection::Impl {
     sqlite3* db{nullptr};
     int depth{0};                               // open BeginTrans levels
     std::unique_ptr<detail::OdbcSession> odbc;  // set when ODBC is the backend
+    std::shared_ptr<detail::SqliteHandle> handle{
+        std::make_shared<detail::SqliteHandle>()};  // shared with linked sets
 };
+
+namespace {
+
+[[nodiscard]] bool is_word_char(const char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+// The index after the quoted name or string that starts at i.
+[[nodiscard]] std::size_t skip_quoted(const std::string_view text,
+                                      const std::size_t i) {
+    const char open = text[i];
+    const char close = open == '[' ? ']' : open;
+    std::size_t j = i + 1;
+    while (j < text.size()) {
+        if (text[j] == close) {
+            if (close != ']' && j + 1 < text.size() && text[j + 1] == close) {
+                j += 2;
+                continue;
+            }
+            return j + 1;
+        }
+        ++j;
+    }
+    return text.size();
+}
+
+[[nodiscard]] bool is_quote(const char c) {
+    return c == '\'' || c == '"' || c == '[' || c == '`';
+}
+
+[[nodiscard]] bool word_at(const std::string_view text, const std::size_t i,
+                           const std::string_view word) {
+    if (i + word.size() > text.size() || (i > 0 && is_word_char(text[i - 1]))) {
+        return false;
+    }
+    for (std::size_t k = 0; k < word.size(); ++k) {
+        if (std::tolower(static_cast<unsigned char>(text[i + k])) != word[k]) {
+            return false;
+        }
+    }
+    return i + word.size() == text.size() || !is_word_char(text[i + word.size()]);
+}
+
+[[nodiscard]] std::size_t skip_space(const std::string_view text,
+                                     std::size_t i) {
+    while (i < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[i])) != 0) {
+        ++i;
+    }
+    return i;
+}
+
+// An identifier (bare or quoted) at i; sets end past it and returns its text
+// as written, or empty when there is none.
+[[nodiscard]] std::string read_identifier(const std::string_view text,
+                                          const std::size_t i,
+                                          std::size_t& end) {
+    if (i >= text.size()) {
+        return {};
+    }
+    if (is_quote(text[i]) && text[i] != '\'') {
+        end = skip_quoted(text, i);
+        return std::string(text.substr(i, end - i));
+    }
+    std::size_t j = i;
+    while (j < text.size() && is_word_char(text[j])) {
+        ++j;
+    }
+    end = j;
+    return std::string(text.substr(i, j - i));
+}
+
+// The name an identifier stands for, without its quotes.
+[[nodiscard]] std::string bare_name(const std::string& written) {
+    if (written.size() >= 2 && is_quote(written.front())) {
+        return written.substr(1, written.size() - 2);
+    }
+    return written;
+}
+
+[[nodiscard]] bool same_name(const std::string_view a, const std::string_view b) {
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+               return std::tolower(static_cast<unsigned char>(x)) ==
+                      std::tolower(static_cast<unsigned char>(y));
+           });
+}
+
+struct LinkPlan {
+    std::string sql;  // the query with the row id as its first column
+    detail::SqliteLink link;
+};
+
+// A SELECT of plain columns from one table, with at most WHERE, ORDER BY and
+// LIMIT after it, can be written back to that table. Anything else (joins,
+// expressions, grouping, aliases of the table) is read-only.
+[[nodiscard]] bool plan_link(sqlite3* db, std::string_view sql,
+                             LinkPlan& plan) {
+    while (!sql.empty() &&
+           (sql.back() == ';' ||
+            std::isspace(static_cast<unsigned char>(sql.back())) != 0)) {
+        sql.remove_suffix(1);
+    }
+    std::size_t i = skip_space(sql, 0);
+    if (!word_at(sql, i, "select")) {
+        return false;
+    }
+    i += 6;
+    const std::size_t list_begin = i;
+    std::size_t from = std::string_view::npos;
+    for (std::size_t j = i; j < sql.size();) {
+        const char c = sql[j];
+        if (is_quote(c)) {
+            j = skip_quoted(sql, j);
+            continue;
+        }
+        if (c == '(' || c == ')' || c == ';') {
+            return false;
+        }
+        if (word_at(sql, j, "from")) {
+            from = j;
+            break;
+        }
+        ++j;
+    }
+    if (from == std::string_view::npos) {
+        return false;
+    }
+    // The select list: * or plain columns, each with an optional alias.
+    std::vector<std::string> sources;
+    bool star = false;
+    std::size_t at = skip_space(sql, list_begin);
+    while (at < from) {
+        if (sql[at] == '*') {
+            star = true;
+            at = skip_space(sql, at + 1);
+            break;
+        }
+        std::size_t end = at;
+        const std::string column = read_identifier(sql, at, end);
+        if (column.empty() || word_at(sql, at, "distinct")) {
+            return false;
+        }
+        sources.push_back(bare_name(column));
+        at = skip_space(sql, end);
+        if (word_at(sql, at, "as")) {
+            at = skip_space(sql, at + 2);
+        }
+        if (at < from && sql[at] != ',') {
+            if (read_identifier(sql, at, end).empty()) {
+                return false;
+            }
+            at = skip_space(sql, end);
+        }
+        if (at < from && sql[at] == ',') {
+            at = skip_space(sql, at + 1);
+        } else if (at < from) {
+            return false;
+        }
+    }
+    if (at != from || (star && !sources.empty()) ||
+        (!star && sources.empty())) {
+        return false;
+    }
+    // The table, then nothing or WHERE / ORDER BY / LIMIT.
+    std::size_t end = from + 4;
+    const std::string table = read_identifier(sql, skip_space(sql, end), end);
+    if (table.empty() || (end < sql.size() && sql[end] == '.')) {
+        return false;
+    }
+    const std::size_t rest = skip_space(sql, end);
+    if (rest < sql.size() && !word_at(sql, rest, "where") &&
+        !word_at(sql, rest, "order") && !word_at(sql, rest, "limit")) {
+        return false;
+    }
+    for (std::size_t j = rest; j < sql.size();) {
+        if (is_quote(sql[j])) {
+            j = skip_quoted(sql, j);
+            continue;
+        }
+        if (sql[j] == ';') {
+            return false;
+        }
+        for (const char* word : {"select", "join", "group", "having", "union",
+                                 "intersect", "except", "window"}) {
+            if (word_at(sql, j, word)) {
+                return false;
+            }
+        }
+        ++j;
+    }
+    // The table's own column names.
+    std::vector<std::string> names;
+    sqlite3_stmt* stmt = nullptr;
+    const std::string pragma = "PRAGMA table_info(" + table + ")";
+    if (sqlite3_prepare_v2(db, pragma.c_str(), -1, &stmt, nullptr) !=
+        SQLITE_OK) {
+        return false;
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        names.emplace_back(
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
+    }
+    sqlite3_finalize(stmt);
+    if (names.empty()) {
+        return false;
+    }
+    if (star) {
+        sources = names;
+    } else {
+        for (auto& source : sources) {
+            const auto hit =
+                std::find_if(names.begin(), names.end(), [&](const auto& n) {
+                    return same_name(n, source);
+                });
+            if (hit == names.end()) {
+                return false;
+            }
+            source = *hit;
+        }
+    }
+    plan.sql = "SELECT _rowid_ AS wfc_rowid, " +
+               std::string(sql.substr(list_begin));
+    plan.link.table = table;
+    plan.link.columns = std::move(sources);
+    return true;
+}
+
+}  // namespace
 
 Connection::Connection() : impl_(std::make_unique<Impl>()) {}
 
@@ -790,6 +1262,7 @@ bool Connection::open(const std::string_view connection_string) {
         return false;
     }
     impl_->db = db;
+    impl_->handle->db = db;
     impl_->depth = 0;
     sqlite3_busy_timeout(db, 5000);
     return true;
@@ -808,6 +1281,7 @@ void Connection::close() noexcept {
     sqlite3_exec(impl_->db, "ROLLBACK", nullptr, nullptr, nullptr);
     sqlite3_close_v2(impl_->db);
     impl_->db = nullptr;
+    impl_->handle->db = nullptr;
     impl_->depth = 0;
 }
 
@@ -825,6 +1299,34 @@ std::int64_t Connection::last_insert_id() const noexcept {
 
 Result Connection::execute(const std::string_view sql,
                            const std::vector<Value>& params) {
+    return run(sql, params, false);
+}
+
+Result Connection::execute_updatable(const std::string_view sql,
+                                     const std::vector<Value>& params) {
+    LinkPlan plan;
+    if (impl_->odbc == nullptr && impl_->db != nullptr &&
+        plan_link(impl_->db, sql, plan)) {
+        const std::size_t before = errors_.size();
+        Result result = run(plan.sql, params, true);
+        if (result.ok && result.recordset != nullptr) {
+            auto& set = *result.recordset;
+            plan.link.handle = impl_->handle;
+            set.link_ = std::make_shared<detail::SqliteLink>(plan.link);
+            set.editable_ = true;
+            for (std::size_t i = 0; i < set.rows_.size(); ++i) {
+                set.ids_.push_back(static_cast<long>(i) + 1);
+            }
+            set.next_id_ = static_cast<long>(set.rows_.size());
+            return result;
+        }
+        errors_.resize(before);  // e.g. a view has no row id: read-only
+    }
+    return run(sql, params, false);
+}
+
+Result Connection::run(const std::string_view sql,
+                       const std::vector<Value>& params, const bool keyed) {
     Result result;
     if (impl_->odbc != nullptr) {
         detail::OdbcTable table;
@@ -866,34 +1368,7 @@ Result Connection::execute(const std::string_view sql,
         fail(3708, "Parameter object is improperly defined.");
         return result;
     }
-    for (int i = 0; i < wanted; ++i) {
-        const Value& v = params[static_cast<std::size_t>(i)];
-        const int slot = i + 1;
-        switch (v.index()) {
-            case 1:
-                sqlite3_bind_int64(stmt, slot, std::get<1>(v));
-                break;
-            case 2:
-                sqlite3_bind_double(stmt, slot, std::get<2>(v));
-                break;
-            case 3: {
-                const auto& text = std::get<3>(v);
-                sqlite3_bind_text(stmt, slot, text.data(),
-                                  static_cast<int>(text.size()),
-                                  SQLITE_TRANSIENT);
-                break;
-            }
-            case 4: {
-                const auto& blob = std::get<4>(v);
-                sqlite3_bind_blob(stmt, slot, blob.data(),
-                                  static_cast<int>(blob.size()),
-                                  SQLITE_TRANSIENT);
-                break;
-            }
-            default:
-                sqlite3_bind_null(stmt, slot);
-        }
-    }
+    bind_all(stmt, params);
 
     auto set = std::make_shared<Recordset>();
     const int columns = sqlite3_column_count(stmt);
@@ -904,37 +1379,20 @@ Result Connection::execute(const std::string_view sql,
                           : "",
                       type_from_declared(sqlite3_column_decltype(stmt, c))});
     }
+    if (keyed) {
+        set->fields_.erase(set->fields_.begin());
+    }
     int status = SQLITE_OK;
     while ((status = sqlite3_step(stmt)) == SQLITE_ROW) {
         std::vector<Value> row;
         row.reserve(static_cast<std::size_t>(columns));
         for (int c = 0; c < columns; ++c) {
-            switch (sqlite3_column_type(stmt, c)) {
-                case SQLITE_INTEGER:
-                    row.emplace_back(static_cast<std::int64_t>(
-                        sqlite3_column_int64(stmt, c)));
-                    break;
-                case SQLITE_FLOAT:
-                    row.emplace_back(sqlite3_column_double(stmt, c));
-                    break;
-                case SQLITE_TEXT:
-                    row.emplace_back(
-                        std::string(reinterpret_cast<const char*>(
-                                        sqlite3_column_text(stmt, c)),
-                                    static_cast<std::size_t>(
-                                        sqlite3_column_bytes(stmt, c))));
-                    break;
-                case SQLITE_BLOB: {
-                    const auto* bytes = static_cast<const unsigned char*>(
-                        sqlite3_column_blob(stmt, c));
-                    const auto size =
-                        static_cast<std::size_t>(sqlite3_column_bytes(stmt, c));
-                    row.emplace_back(Blob(bytes, bytes + size));
-                    break;
-                }
-                default:
-                    row.emplace_back(std::monostate{});
-            }
+            row.push_back(column_value(stmt, c));
+        }
+        if (keyed) {
+            const auto* key = std::get_if<std::int64_t>(&row.front());
+            set->keys_.push_back(key != nullptr ? *key : 0);
+            row.erase(row.begin());
         }
         set->rows_.push_back(std::move(row));
     }
