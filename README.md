@@ -89,6 +89,26 @@ IDL was written once from the member lists of the Microsoft type library by
 `msado15.dll`, which is not part of this repository); every identifier in it is
 WFC's own.
 
+## Installing with WPM
+
+Each release is a signed WPM package, `wfc-adodb`, with the index of the
+release (`index.json`) beside it. Trust the WFC release key once, add the
+release as a WPM repository, and install:
+
+```powershell
+Invoke-WebRequest `
+  https://raw.githubusercontent.com/Thewafflication/wfc/master/release_keys/wfc-release.public `
+  -OutFile wfc-release.public
+wpm trust add wfc-release.public
+wpm repo add https://github.com/Thewafflication/wfc-adodb/releases/latest/download
+wpm update
+wpm install wfc-adodb
+```
+
+The install script puts `msado15.dll` for x86, x64 and ARM64 under
+`lib\wfcadodb\<version>\<arch>` of the WFC installation and registers the
+ones this Windows can run (`wpm remove wfc-adodb` unregisters them).
+
 ## Build and test
 
 ```powershell
