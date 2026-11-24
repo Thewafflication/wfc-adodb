@@ -2,8 +2,10 @@ name: Release
 
 # A version tag (the version in VERSION) builds, tests, packs, signs and
 # verifies wfc-adodb-any-<version>.zip with the release workflow every WFC
-# library shares (Thewafflication/wfc, .github/workflows/library-release.yml).
-# A manual run with dry_run builds an unsigned package to try it.
+# library shares (Thewafflication/wfc, .github/workflows/library-release.yml),
+# then publishes the GitHub release with the package, index.json and
+# SHA256SUMS (library-publish.yml). A manual run with dry_run builds an
+# unsigned package to try it and publishes nothing.
 
 on:
   push:
@@ -25,3 +27,12 @@ jobs:
       library: adodb
       dry_run: ${{ inputs.dry_run == true }}
     secrets: inherit
+
+  publish:
+    needs: release
+    if: ${{ !inputs.dry_run && startsWith(github.ref, 'refs/tags/') }}
+    permissions:
+      contents: write
+    uses: Thewafflication/wfc/.github/workflows/library-publish.yml@master
+    with:
+      library: adodb
